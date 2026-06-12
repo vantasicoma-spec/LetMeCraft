@@ -1,0 +1,24 @@
+PROJECT_PROGRESS.md
+
+# Claude / IDE
+.claude/
+
+cpp/RE-UE4SS/
+
+# CMake / Visual Studio
+cpp/build*/
+*.dll
+*.pdb
+*.lib
+*.exp
+*.obj
+*.ilk
+*.sln
+*.vcxproj
+*.vcxproj.*
+
+*.log
+UECC-*/
+
+*.exe
+UE4SS_v*/
