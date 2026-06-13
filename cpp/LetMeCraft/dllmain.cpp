@@ -8,7 +8,6 @@
 #include <Unreal/FWeakObjectPtr.hpp>
 #include <Unreal/Hooks/Hooks.hpp>
 #include <Unreal/Core/Containers/FString.hpp>
-#include <Unreal/Core/Containers/Map.hpp>
 #include <Unreal/NameTypes.hpp>
 #include <Unreal/UObject.hpp>
 #include <Unreal/UObjectGlobals.hpp>
@@ -112,13 +111,9 @@ namespace
     constexpr double kMaxTargetDistanceSquared = kMaxTargetDistance * kMaxTargetDistance;
     // The manual E trigger fires when the player stands up to 4.0m from the
     // STATION pivot (user-calibrated 2026-06-13, was 3.5m; the pivot can sit
-    // ~1m past the usable face - v0.7.10). v0.8.7: the min gate is gone - the
-    // mod now auto-walks the player to kApproachStopDistance, so a repeat E
+    // ~1m past the usable face - v0.7.10). v0.8.7: there is no minimum gate -
+    // the mod auto-walks the player to kApproachStopDistance, so a repeat E
     // pressed while standing point-blank at the station must not be rejected.
-    // The old reason for a floor (the look-based query going blind at close
-    // range) is covered by the live sensor + the approach itself.
-    constexpr double kMinStationDistance = 0.0;
-    constexpr double kMinStationDistanceSquared = kMinStationDistance * kMinStationDistance;
     constexpr double kMaxStationDistance = 400.0;
     constexpr double kMaxStationDistanceSquared = kMaxStationDistance * kMaxStationDistance;
     // Every station's UInteractiveComponent reports interactDist=250 (v0.8.6
@@ -128,7 +123,6 @@ namespace
     // margin, and far enough to feel natural (1.4m and 1.6m both read as
     // "pressed against the station" to the user).
     constexpr double kApproachStopDistance = 200.0;
-    constexpr double kApproachStopDistanceSquared = kApproachStopDistance * kApproachStopDistance;
     constexpr double kHeldFallbackDistance = 900.0;
     constexpr double kHeldFallbackDistanceSquared = kHeldFallbackDistance * kHeldFallbackDistance;
     // No teleports: teleport + per-second enforcement provoked the game's own routine
@@ -225,13 +219,6 @@ namespace
     // the conflict-free case.
     constexpr double kApproachMinStopDistance = 120.0;
     constexpr double kApproachStopShrinkStep = 20.0;
-    // Fallback when the player-claim fails its requirement checks (e.g. "Character has
-    // no GASAbility for this action"): a cooldown written straight into the live
-    // FInteractionSpot record suppresses routine re-claims without any user checks.
-    constexpr float kSpotCooldownSeconds = 75.0f;
-    constexpr int32_t kSpotCooldownDurationOffset = 0xB8;
-    constexpr int32_t kSpotLastTimeUsedOffset = 0xBC;
-    constexpr int32_t kInteractionSpotValueSize = 0x118;
 
     struct BoolRead
     {
@@ -319,17 +306,13 @@ namespace
         bool retreat_dest_known{};
         StringType owner_name{};
         StringType avatar_name{};
-        StringType source{};
         alignas(8) unsigned char claim_token[16]{};
-        float saved_cooldown_duration{};
-        float saved_last_time_used{};
         int claim_attempts{};
         int player_use_attempts{};
         bool spot_known{};
         bool move_issued{};
         bool has_claim{};
         bool claim_gave_up{};
-        bool has_cooldown_write{};
         bool player_use_done{};
         // Set ONLY on a successful take (player_use_done alone also marks a
         // closed/failed window). Once the player runs the station the routine
@@ -338,19 +321,13 @@ namespace
         // (v0.8.11: the game died in its own code right after such a take).
         bool player_took_station{};
         bool npc_interaction_disabled{};
-        // One log line each for "approach started" / "approach done" - the
-        // drive itself runs every engine tick and must not spam.
-        bool approach_started{};
+        // Arrival gate: set once the player reached the approach stop; no
+        // activation while they are still walking (v0.8.9).
         bool approach_done{};
         // Effective approach stop for THIS eviction: starts at the 2.0m
         // default and shrinks while the player's sensor prefers a neighboring
         // interactive over the target station (the activation gate).
         double approach_stop_distance{kApproachStopDistance};
-        // Hot-loop log diet (v0.8.11): the 10Hz combo force-release and the 1Hz
-        // behind-hold re-issue logged every occurrence - dozens of synchronous
-        // file+console writes per second on top of the object-array sweeps.
-        bool combo_release_logged{};
-        int behind_hold_reissues{};
         // v0.8.16 routine blocker state: known = a safe tag was selected from
         // ActivationBlockedTags; applied = it currently sits on the NPC's ASC.
         bool blocker_known{};
@@ -429,15 +406,25 @@ namespace
         return is_usable(object) ? Cast<AActor>(object) : nullptr;
     }
 
-    auto same_object(UObject* lhs, UObject* rhs) -> bool
-    {
-        return is_usable(lhs) && is_usable(rhs) && lhs == rhs;
-    }
-
     auto weak_get(const FWeakObjectPtr& weak) -> UObject*
     {
         auto* object = weak.Get();
         return is_usable(object) ? object : nullptr;
+    }
+
+    // CDO-tolerant weak resolve: is_usable() rejects CDOs by design, but the
+    // /Script library CDOs cached for the spot/token calls are exactly that.
+    // Same item-identity and destruction checks as is_usable, minus the CDO
+    // rejection.
+    auto weak_get_cdo(const FWeakObjectPtr& weak) -> UObject*
+    {
+        auto* object = weak.Get();
+        if (!object) { return nullptr; }
+        auto* item = object->GetObjectItem();
+        if (!item || item->GetUObject() != object) { return nullptr; }
+        if (item->IsUnreachable() || item->IsPendingKill()) { return nullptr; }
+        if (object->HasAnyFlags(RF_BeginDestroyed) || object->HasAnyFlags(RF_FinishDestroyed)) { return nullptr; }
+        return object;
     }
 
     auto read_bool(UObject* object, const TCHAR* property_name) -> BoolRead
@@ -496,14 +483,6 @@ namespace
         if (!value_ptr) { return {}; }
 
         return {true, *static_cast<FName*>(value_ptr)};
-    }
-
-    auto fname_text(const NameRead& name) -> StringType
-    {
-        if (!name.found) { return STR("<none>"); }
-
-        auto value = name.value;
-        return value.ToString();
     }
 
     auto fname_to_text(const FName& name) -> StringType
@@ -821,44 +800,10 @@ namespace
             object_property->ContainerPtrToValuePtr<void>(call.params.data()));
     }
 
-    // Releases an interaction-spot claim token through the BlueprintFunctionLibrary CDO
-    // (is_usable() rejects CDOs by design, hence the dedicated path).
-    auto call_token_library_unclaim(unsigned char (&token)[16], const TCHAR* context) -> bool
-    {
-        auto* function = UObjectGlobals::StaticFindObject<UFunction*>(
-            nullptr, nullptr, STR("/Script/G1R.InteractionSpotTokenLibrary:Unclaim"));
-        auto* library = UObjectGlobals::StaticFindObject<UObject*>(
-            nullptr, nullptr, STR("/Script/G1R.Default__InteractionSpotTokenLibrary"));
-        if (!function || !library)
-        {
-            Output::send<LogLevel::Warning>(
-                STR("[LetMeCraft] {}: token library unavailable (function={} cdo={}).\n"),
-                context,
-                function ? STR("ok") : STR("missing"),
-                library ? STR("ok") : STR("missing"));
-            return false;
-        }
-
-        auto call = begin_call_with_function(library, function, context);
-        set_param(call, STR("Handle"), token, 16, context);
-        if (!invoke_call(call, context)) { return false; }
-
-        get_param(call, STR("Handle"), token, 16, context);
-        return true;
-    }
-
     // AAIController::MoveToLocation — the NPC walks to the destination on its own.
     auto issue_move_to_location(
-        UObject* controller, const FVector& destination, const TCHAR* context, bool quiet = false) -> bool
+        UObject* controller, const FVector& destination, const TCHAR* context) -> bool
     {
-        if (!quiet)
-        {
-            Output::send<LogLevel::Verbose>(
-                STR("[LetMeCraft] {} MoveToLocation preparing controller={}.\n"),
-                context,
-                object_name(controller));
-        }
-
         auto call = begin_native_call(
             controller,
             STR("/Script/AIModule.AIController:MoveToLocation"),
@@ -875,21 +820,7 @@ namespace
         set_bool_param(call, STR("bCanStrafe"), false, context);
         set_param(call, STR("FilterClass"), &filter_class, 8, context);
         set_bool_param(call, STR("bAllowPartialPath"), true, context);
-        if (!invoke_call(call, context)) { return false; }
-
-        unsigned char request_result{};
-        get_param(call, STR("ReturnValue"), &request_result, 1, context);
-        if (!quiet)
-        {
-            Output::send<LogLevel::Verbose>(
-                STR("[LetMeCraft] {} MoveToLocation result={} dest=({}, {}, {}).\n"),
-                context,
-                static_cast<int>(request_result),
-                dest.X(),
-                dest.Y(),
-                dest.Z());
-        }
-        return true;
+        return invoke_call(call, context);
     }
 
     auto root_task_is_crafting(UObject* root_task) -> bool
@@ -1101,32 +1032,6 @@ namespace
         return false;
     }
 
-    auto post_check_delay_for_index(int index) -> Clock::duration
-    {
-        switch (index)
-        {
-        case 0:
-            return std::chrono::seconds{2};
-        case 1:
-            return std::chrono::seconds{15};
-        default:
-            return std::chrono::seconds{120};
-        }
-    }
-
-    auto post_check_label_for_index(int index) -> const TCHAR*
-    {
-        switch (index)
-        {
-        case 0:
-            return STR("post-check 2s");
-        case 1:
-            return STR("post-check 15s");
-        default:
-            return STR("post-check 120s");
-        }
-    }
-
 }
 
 class LetMeCraft : public CppUserModBase
@@ -1135,7 +1040,7 @@ public:
     LetMeCraft() : CppUserModBase()
     {
         ModName = STR("LetMeCraft");
-        ModVersion = STR("0.8.18");
+        ModVersion = STR("0.9.0");
         ModDescription = STR("Moves the nearest NPC away from an occupied crafting station");
         ModAuthors = STR("Roma + Codex");
     }
@@ -1151,9 +1056,7 @@ public:
     auto on_unreal_init() -> void override
     {
         Output::send<LogLevel::Verbose>(
-            STR("[LetMeCraft] loaded. Press E or gamepad Y near an occupied crafting NPC.\n"));
-        Output::send<LogLevel::Verbose>(
-            STR("[LetMeCraft] v0.8.18: mod renamed MoveNPCsCxx -> LetMeCraft (game Mods folder, mods.txt entry, log prefix, build target); no behavior changes vs v0.8.17 (E range 4.0m, routine blocker tag).\n"));
+            STR("[LetMeCraft] v0.9.0 loaded. Press E or gamepad Y near an occupied crafting NPC. Release cleanup: dead code & diagnostics removed, hot paths cached; behavior identical to v0.8.18.\n"));
 
         register_keydown_event(Input::Key::E, [this]() {
             queue_manual_request(STR("keyboard E"));
@@ -1206,9 +1109,6 @@ private:
 
     auto clear_transient_state(const TCHAR* reason) -> void
     {
-        const auto eviction_count = m_evictions.size();
-        const auto had_post_check = m_post_check_active;
-
         // Claim tokens are dropped without Unclaim: the world that owned the claims is
         // being torn down together with the spots themselves.
         unlock_player_movement(reason);
@@ -1240,23 +1140,12 @@ private:
         m_cached_player_state = static_cast<UObject*>(nullptr);
         m_cached_player_sensor = static_cast<UObject*>(nullptr);
         m_cached_player_interact_ability = static_cast<UObject*>(nullptr);
-        m_post_check_active = false;
-        m_post_check_owner_name.clear();
-        m_post_check_avatar_name.clear();
-        m_post_check_started_at = {};
-        m_post_check_index = 0;
 
         {
             std::lock_guard lock{m_pending_request_mutex};
             m_has_pending_manual_request = false;
             m_pending_manual_source.clear();
         }
-
-        Output::send<LogLevel::Verbose>(
-            STR("[LetMeCraft] clear_transient_state reason={} droppedEvictions={} droppedPostCheck={}.\n"),
-            reason,
-            eviction_count,
-            had_post_check ? STR("true") : STR("false"));
     }
 
     auto on_engine_tick_game_thread() -> void
@@ -1303,7 +1192,6 @@ private:
             }
 
             tick_evictions();
-            tick_post_check();
 
             // Hard failsafe: the movement lock can never outlive its time budget.
             if (m_move_input_locked && Clock::now() >= m_move_unlock_at)
@@ -1347,35 +1235,20 @@ private:
         if (auto* player_controller = find_player_controller_cached())
         {
             const auto cursor = read_bool(player_controller, STR("bShowMouseCursor"));
-            if (cursor.found && cursor.value)
-            {
-                Output::send<LogLevel::Verbose>(
-                    STR("[LetMeCraft] {} request ignored: UI cursor is visible.\n"),
-                    source);
-                return;
-            }
+            if (cursor.found && cursor.value) { return; }
         }
 
         const auto now = Clock::now();
-        if (now < m_next_manual_request_time)
-        {
-            Output::send<LogLevel::Verbose>(
-                STR("[LetMeCraft] {} request ignored by cooldown.\n"),
-                source);
-            return;
-        }
+        if (now < m_next_manual_request_time) { return; }
 
         m_next_manual_request_time = now + kManualRequestCooldown;
 
-        log_track_b_recon(source);
-
-        const auto result = request_end_matching_crafter(source, true);
+        const auto result = request_end_matching_crafter(source);
         if (result.called)
         {
-            // Separate guards: a throw inside start_eviction (the v0.7.4 FuncMap bug
-            // skipped the move lock AND the post-check) must not cancel the rest.
+            // Own guard: a throw inside start_eviction (the v0.7.4 FuncMap bug
+            // skipped the move lock) must not escape to the tick handler.
             run_guarded(STR("start eviction"), [&] { start_eviction(result.candidate, source, now); });
-            run_guarded(STR("schedule post-check"), [&] { schedule_post_check(result.candidate, now); });
             return;
         }
 
@@ -1383,17 +1256,6 @@ private:
         {
             run_guarded(STR("refresh eviction"), [&] { refresh_eviction(*eviction, source, now); });
         }
-    }
-
-    // Track-B recon: log the stable objects v0.7.0 will call into
-    // (UInteractionSubsystem::ClaimSpot, player's AGothicPlayerState).
-    auto log_track_b_recon(const TCHAR* source) -> void
-    {
-        Output::send<LogLevel::Verbose>(
-            STR("[LetMeCraft] {} recon interactionSubsystem={} playerState={}.\n"),
-            source,
-            object_name(find_interaction_subsystem()),
-            object_name(find_player_state()));
     }
 
     // FindAllOf walks the entire object array (expensive); the stable singletons are
@@ -1480,30 +1342,12 @@ private:
         return nullptr;
     }
 
-    // The sensor retargets m_CurrentInteractionActor on its own sensing ticks, so a
-    // single write is not enough: in the v0.7.5 test the activated interaction kept
-    // picking the nearest interactive instead - the evicted NPC (dialogue) or a
-    // closer station. Freezing the sensing for the player-use window pins the target.
-    // Unfreeze is triple-failsafed: eviction end, map change, engine-tick fallback.
-    auto freeze_player_sensor() -> void
-    {
-        if (m_sensor_frozen) { return; }
-        auto* sensor = find_player_sensor();
-        if (!sensor) { return; }
-
-        auto call = begin_call(sensor, STR("SetSensingUpdatesEnabled"), STR("sensor freeze"));
-        set_bool_param(call, STR("bEnabled"), false, STR("sensor freeze"));
-        if (!invoke_call(call, STR("sensor freeze"))) { return; }
-
-        m_sensor_frozen = true;
-        Output::send<LogLevel::Verbose>(STR("[LetMeCraft] sensor sensing frozen.\n"));
-    }
-
+    // Sensing stays live since v0.8.6; what still needs cleanup when the take
+    // window closes is the m_FilterActor pin written per attempt (it used to
+    // live behind the frozen flag). The m_sensor_frozen branch survives as a
+    // belt for the triple-failsafed cleanup paths.
     auto unfreeze_player_sensor(const TCHAR* reason) -> void
     {
-        // v0.8.6: sensing is no longer frozen for the take window, but the
-        // m_FilterActor pin written per attempt still needs clearing when the
-        // window closes - that cleanup used to live behind the frozen flag.
         if (m_sensor_pinned)
         {
             run_guarded(STR("sensor unpin"), [&] {
@@ -1513,8 +1357,6 @@ private:
                 }
             });
             m_sensor_pinned = false;
-            Output::send<LogLevel::Verbose>(
-                STR("[LetMeCraft] sensor filter unpinned reason={}.\n"), reason);
         }
 
         if (!m_sensor_frozen) { return; }
@@ -1538,17 +1380,33 @@ private:
         }
 
         m_sensor_frozen = false;
-        Output::send<LogLevel::Verbose>(STR("[LetMeCraft] sensor sensing unfrozen reason={}.\n"), reason);
     }
 
     auto is_spot_unclaimed(const FName& spot) -> bool
     {
         auto* subsystem = find_interaction_subsystem();
-        auto* function = UObjectGlobals::StaticFindObject<UFunction*>(
-            nullptr, nullptr, STR("/Script/G1R.InteractionSpotHandleLibrary:IsUnclaimed"));
-        auto* library = UObjectGlobals::StaticFindObject<UObject*>(
-            nullptr, nullptr, STR("/Script/G1R.Default__InteractionSpotHandleLibrary"));
-        if (!subsystem || !function || !library) { return false; }
+        if (!subsystem) { return false; }
+
+        // Cached resolve: this runs every engine tick during the claim poll
+        // (v0.8.13 - the poll itself must stay) and used to pay two
+        // StaticFindObject scans per call. /Script objects are permanent;
+        // population happens at first use under the caller's run_guarded, in
+        // ticks where these exact lookups already ran before v0.9.0.
+        auto* function = static_cast<UFunction*>(weak_get(m_spot_unclaimed_function));
+        if (!function)
+        {
+            function = UObjectGlobals::StaticFindObject<UFunction*>(
+                nullptr, nullptr, STR("/Script/G1R.InteractionSpotHandleLibrary:IsUnclaimed"));
+            if (function) { m_spot_unclaimed_function = static_cast<UObject*>(function); }
+        }
+        auto* library = weak_get_cdo(m_spot_handle_library);
+        if (!library)
+        {
+            library = UObjectGlobals::StaticFindObject<UObject*>(
+                nullptr, nullptr, STR("/Script/G1R.Default__InteractionSpotHandleLibrary"));
+            if (library) { m_spot_handle_library = library; }
+        }
+        if (!function || !library) { return false; }
 
         auto call = begin_call_with_function(library, function, STR("spot free check"));
         auto handle = spot;
@@ -1557,6 +1415,43 @@ private:
         if (!invoke_call(call, STR("spot free check"))) { return false; }
 
         return get_bool_param(call, STR("ReturnValue"), STR("spot free check"));
+    }
+
+    // Releases an interaction-spot claim token through the BlueprintFunctionLibrary CDO
+    // (is_usable() rejects CDOs by design, hence the weak_get_cdo path). Function and
+    // CDO are resolve-once cached like the spot-free pair above.
+    auto call_token_library_unclaim(unsigned char (&token)[16], const TCHAR* context) -> bool
+    {
+        auto* function = static_cast<UFunction*>(weak_get(m_token_unclaim_function));
+        if (!function)
+        {
+            function = UObjectGlobals::StaticFindObject<UFunction*>(
+                nullptr, nullptr, STR("/Script/G1R.InteractionSpotTokenLibrary:Unclaim"));
+            if (function) { m_token_unclaim_function = static_cast<UObject*>(function); }
+        }
+        auto* library = weak_get_cdo(m_token_library);
+        if (!library)
+        {
+            library = UObjectGlobals::StaticFindObject<UObject*>(
+                nullptr, nullptr, STR("/Script/G1R.Default__InteractionSpotTokenLibrary"));
+            if (library) { m_token_library = library; }
+        }
+        if (!function || !library)
+        {
+            Output::send<LogLevel::Warning>(
+                STR("[LetMeCraft] {}: token library unavailable (function={} cdo={}).\n"),
+                context,
+                function ? STR("ok") : STR("missing"),
+                library ? STR("ok") : STR("missing"));
+            return false;
+        }
+
+        auto call = begin_call_with_function(library, function, context);
+        set_param(call, STR("Handle"), token, 16, context);
+        if (!invoke_call(call, context)) { return false; }
+
+        get_param(call, STR("Handle"), token, 16, context);
+        return true;
     }
 
     // The player presses E to take the station: their movement is locked for a few
@@ -1583,7 +1478,6 @@ private:
         // (v0.7.9 log) - each route runs under its own guard so one throwing route
         // cannot eat the other.
         UFunction* function = nullptr;
-        const TCHAR* route = STR("children-walk");
         try
         {
             function = find_function_via_children(chain_object, function_name);
@@ -1593,7 +1487,6 @@ private:
         }
         if (!function)
         {
-            route = STR("path");
             try
             {
                 function = UObjectGlobals::StaticFindObject<UFunction*>(nullptr, nullptr, function_path);
@@ -1607,11 +1500,6 @@ private:
         if (!function) { return nullptr; }
 
         cache = static_cast<UObject*>(function);
-        Output::send<LogLevel::Verbose>(
-            STR("[LetMeCraft] {}: {} resolved via {}.\n"),
-            context,
-            function_name,
-            route);
         return function;
     }
 
@@ -1671,12 +1559,7 @@ private:
         auto* player = find_player_actor_cached();
         if (!player) { return; }
         auto* property = CastField<FIntProperty>(player->GetPropertyByNameInChain(STR("JumpMaxCount")));
-        if (!property)
-        {
-            Output::send<LogLevel::Verbose>(
-                STR("[LetMeCraft] jump toggle skipped: JumpMaxCount not found on player.\n"));
-            return;
-        }
+        if (!property) { return; }
         if (!enabled)
         {
             const auto current = property->GetPropertyValueInContainer(player);
@@ -1688,8 +1571,6 @@ private:
             property->SetPropertyValueInContainer(
                 player, m_saved_jump_max_count > 0 ? m_saved_jump_max_count : 1);
         }
-        Output::send<LogLevel::Verbose>(
-            STR("[LetMeCraft] player jump {}.\n"), enabled ? STR("re-enabled") : STR("blocked"));
     }
 
     auto lock_player_movement() -> void
@@ -1714,8 +1595,6 @@ private:
         m_move_unlock_attempts = 0;
         m_move_unlock_at = Clock::now() + kMoveLockDuration;
         run_guarded(STR("jump block"), [&] { set_player_jump_enabled(false); });
-        Output::send<LogLevel::Verbose>(STR("[LetMeCraft] player movement locked (max {}s).\n"),
-            std::chrono::duration_cast<std::chrono::seconds>(kMoveLockDuration).count());
     }
 
     auto unlock_player_movement(const TCHAR* reason) -> void
@@ -1757,7 +1636,6 @@ private:
         m_move_input_locked = false;
         m_move_unlock_attempts = 0;
         run_guarded(STR("jump unblock"), [&] { set_player_jump_enabled(true); });
-        Output::send<LogLevel::Verbose>(STR("[LetMeCraft] player movement unlocked reason={}.\n"), reason);
     }
 
     auto find_nearby_eviction() -> ActiveEviction*
@@ -1800,14 +1678,9 @@ private:
         // the attempt counter restarts so the v0.8.12 cap measures THIS window.
         eviction.player_took_station = false;
         eviction.player_use_attempts = 0;
-        eviction.approach_started = false;
         eviction.approach_done = false;
         eviction.approach_stop_distance = kApproachStopDistance;
         eviction.approach_grace_until = now + kApproachActivationGrace;
-        eviction.combo_release_logged = false;
-        // Keeps the 1-in-5 loud cadence aligned with the new window (the v0.8.11
-        // audit: never resetting this phase-shifted the loud re-issues).
-        eviction.behind_hold_reissues = 0;
         run_guarded(STR("move lock"), [&] { lock_player_movement(); });
 
         // v0.8.16: the tag normally survives a repeat-E (the eviction object is
@@ -1879,7 +1752,6 @@ private:
         eviction.action = action.value;
         eviction.owner_name = candidate.owner_name;
         eviction.avatar_name = candidate.avatar_name;
-        eviction.source = source;
         run_guarded(STR("routine blocker select"), [&] { select_routine_blocker(eviction, candidate); });
         m_evictions.push_back(eviction);
 
@@ -1928,7 +1800,6 @@ private:
         const TCHAR* source,
         const StringType* target_owner_name,
         const StringType* target_avatar_name,
-        bool verbose,
         bool require_player_range = true) -> CraftingSearchResult
     {
         if (!Unreal::IsInGameThreadRaw())
@@ -1942,92 +1813,50 @@ private:
         std::vector<UObject*> abilities{};
         UObjectGlobals::FindAllOf(STR("GameplayAbilityInteractFreePoint"), abilities);
 
-        int scanned{};
-        int skipped_inactive{};
-        int skipped_uncancelable{};
-        int skipped_end_requested{};
-        int skipped_no_root{};
-        int skipped_non_crafting{};
-        int skipped_no_actor{};
-        int skipped_too_far{};
-        int skipped_no_station{};
-        int skipped_station_too_far{};
-        int skipped_station_too_close{};
-        int skipped_target_mismatch{};
-        int candidate_count{};
-
-        auto* player = find_player_actor_cached();
-        const auto player_location = read_actor_location(player);
-        if (verbose)
-        {
-            Output::send<LogLevel::Verbose>(
-                STR("[LetMeCraft] {} request: scanning {} GameplayAbilityInteractFreePoint instances. player={} playerLocation={}\n"),
-                source,
-                abilities.size(),
-                object_name(player),
-                player_location.found ? STR("true") : STR("false"));
-        }
+        const auto player_location = read_actor_location(find_player_actor_cached());
+        const auto has_target = (target_owner_name && !target_owner_name->empty()) ||
+                                (target_avatar_name && !target_avatar_name->empty());
 
         CraftingCandidate best{};
 
         for (auto* ability : abilities)
         {
             if (!is_usable(ability)) { continue; }
-            ++scanned;
 
             const auto active = read_bool(ability, STR("bIsActive"));
+            if (!active.found || !active.value) { continue; }
+
             const auto cancelable = read_bool(ability, STR("bIsCancelable"));
+            if (!cancelable.found || !cancelable.value) { continue; }
+
             const auto end_requested = read_bool(ability, STR("bEndRequested"));
+            if (end_requested.found && end_requested.value) { continue; }
+
             auto* root_task = read_object(ability, STR("RootInteractionTask"));
+            if (!root_task || !root_task_is_crafting(root_task)) { continue; }
+
             auto* asc = find_ability_system(ability, root_task);
             auto* avatar = find_avatar(ability, root_task);
             auto* owner = find_owner(ability, root_task);
-            const auto owner_name = object_name(owner);
-            const auto avatar_name = object_name(avatar);
 
-            if (!active.found || !active.value)
+            // GetFullName allocates a wide string per call; build the names only
+            // when a target filter is set (fallback re-scans) or when stashing
+            // the winning candidate below.
+            StringType owner_name{};
+            StringType avatar_name{};
+            if (has_target)
             {
-                ++skipped_inactive;
-                continue;
-            }
-
-            if (!cancelable.found || !cancelable.value)
-            {
-                ++skipped_uncancelable;
-                continue;
-            }
-
-            if (end_requested.found && end_requested.value)
-            {
-                ++skipped_end_requested;
-                continue;
-            }
-
-            if (!root_task)
-            {
-                ++skipped_no_root;
-                continue;
-            }
-
-            if (!root_task_is_crafting(root_task))
-            {
-                ++skipped_non_crafting;
-                continue;
-            }
-
-            if (!matches_target(owner_name, avatar_name, target_owner_name, target_avatar_name))
-            {
-                ++skipped_target_mismatch;
-                continue;
+                owner_name = object_name(owner);
+                avatar_name = object_name(avatar);
+                if (!matches_target(owner_name, avatar_name, target_owner_name, target_avatar_name))
+                {
+                    continue;
+                }
             }
 
             auto* candidate_actor = find_candidate_actor(avatar, owner);
-            auto candidate_location = read_actor_location(candidate_actor);
-            if (!candidate_location.found)
-            {
-                ++skipped_no_actor;
-                continue;
-            }
+            const auto candidate_location = read_actor_location(candidate_actor);
+            if (!candidate_location.found) { continue; }
 
             auto current_distance_squared = 0.0;
             if (player_location.found)
@@ -2035,126 +1864,44 @@ private:
                 current_distance_squared = distance_squared(player_location.value, candidate_location.value);
                 if (require_player_range && current_distance_squared > kMaxTargetDistanceSquared)
                 {
-                    ++skipped_too_far;
                     continue;
                 }
             }
 
-            // The 1-3m station window applies to the manual trigger only; the kill
+            // The station window applies to the manual trigger only; the kill
             // guard and the combo re-find the SAME eviction target regardless of
-            // where the player has wandered meanwhile.
-            auto* station_actor = read_object(ability, STR("m_InteractiveActor"));
-            auto station_distance_squared = -1.0;
-            if (player_location.found)
-            {
-                const auto station_location = read_actor_location(station_actor);
-                if (station_location.found)
-                {
-                    station_distance_squared = distance_squared(player_location.value, station_location.value);
-                }
-            }
+            // where the player has wandered meanwhile. No minimum gate since
+            // v0.8.7: the mod auto-walks the player in, so a repeat E pressed
+            // point-blank must not be rejected.
             if (require_player_range && player_location.found)
             {
-                const TCHAR* rejection = nullptr;
-                if (station_distance_squared < 0.0)
+                const auto station_location = read_actor_location(read_object(ability, STR("m_InteractiveActor")));
+                if (!station_location.found) { continue; }
+                if (distance_squared(player_location.value, station_location.value) >
+                    kMaxStationDistanceSquared)
                 {
-                    ++skipped_no_station;
-                    rejection = STR("no station location");
-                }
-                else if (station_distance_squared > kMaxStationDistanceSquared)
-                {
-                    ++skipped_station_too_far;
-                    rejection = STR("station too far");
-                }
-                else if (station_distance_squared < kMinStationDistanceSquared)
-                {
-                    ++skipped_station_too_close;
-                    rejection = STR("station too close");
-                }
-                if (rejection)
-                {
-                    if (verbose)
-                    {
-                        // The counters alone proved insufficient (v0.7.9: every E
-                        // rejected with no way to tell the measured distance).
-                        const auto root_spot = read_fname_at(root_task, STR("Spot"));
-                        Output::send<LogLevel::Verbose>(
-                            STR("[LetMeCraft] candidate rejected: {} - stationDistanceSquared={} (allowed {}..{}) spot={} station={} owner={} avatarDistanceSquared={}.\n"),
-                            rejection,
-                            station_distance_squared,
-                            kMinStationDistanceSquared,
-                            kMaxStationDistanceSquared,
-                            fname_text(root_spot),
-                            object_name(station_actor),
-                            owner_name,
-                            current_distance_squared);
-                    }
                     continue;
                 }
-            }
-
-            ++candidate_count;
-            if (verbose)
-            {
-                // Track-B recon: spot + action identify the exact interaction spot the
-                // NPC occupies, ownerGlobalId is the stable NPC re-lookup key. All four
-                // are plain property reads.
-                const auto ability_spot = read_fname_at(ability, STR("m_InteractionSpot"));
-                const auto root_spot = read_fname_at(root_task, STR("Spot"));
-                const auto root_action = read_fname_at(root_task, STR("Action"));
-                const auto owner_global_id = read_fname_at(owner, STR("CharacterGlobalId"));
-
-                Output::send<LogLevel::Verbose>(
-                    STR("[LetMeCraft] candidate ability={} asc={} owner={} avatar={} root={} active={} cancelable={} endRequested={} distanceSquared={} stationDistanceSquared={} spot={} rootSpot={} action={} ownerGlobalId={}\n"),
-                    object_name(ability),
-                    object_name(asc),
-                    owner_name,
-                    avatar_name,
-                    object_name(root_task),
-                    active.found ? (active.value ? STR("true") : STR("false")) : STR("<missing>"),
-                    cancelable.found ? (cancelable.value ? STR("true") : STR("false")) : STR("<missing>"),
-                    end_requested.found ? (end_requested.value ? STR("true") : STR("false")) : STR("<missing>"),
-                    current_distance_squared,
-                    station_distance_squared,
-                    fname_text(ability_spot),
-                    fname_text(root_spot),
-                    fname_text(root_action),
-                    fname_text(owner_global_id));
             }
 
             if (!best.ability || current_distance_squared < best.distance_squared)
             {
-                best = {ability, root_task, asc, owner, avatar, current_distance_squared, owner_name, avatar_name};
+                if (!has_target)
+                {
+                    owner_name = object_name(owner);
+                    avatar_name = object_name(avatar);
+                }
+                best = {ability, root_task, asc, owner, avatar, current_distance_squared,
+                        std::move(owner_name), std::move(avatar_name)};
             }
         }
 
-        if (!best.ability)
-        {
-            if (verbose)
-            {
-                Output::send<LogLevel::Verbose>(
-                    STR("[LetMeCraft] no matching crafting candidate: scanned={} candidates={} inactive={} uncancelable={} end_requested={} no_root={} non_crafting={} no_actor={} too_far={} no_station={} station_too_far={} station_too_close={} target_mismatch={}.\n"),
-                    scanned,
-                    candidate_count,
-                    skipped_inactive,
-                    skipped_uncancelable,
-                    skipped_end_requested,
-                    skipped_no_root,
-                    skipped_non_crafting,
-                    skipped_no_actor,
-                    skipped_too_far,
-                    skipped_no_station,
-                    skipped_station_too_far,
-                    skipped_station_too_close,
-                    skipped_target_mismatch);
-            }
-            return {};
-        }
+        if (!best.ability) { return {}; }
 
         return {true, best};
     }
 
-    auto call_request_end_quick(const CraftingCandidate& candidate, const TCHAR* source) -> bool
+    auto call_request_end_quick(const CraftingCandidate& candidate) -> bool
     {
         if (!is_usable(candidate.ability)) { return false; }
 
@@ -2171,25 +1918,16 @@ private:
         {
         } params{};
 
-        Output::send<LogLevel::Verbose>(
-            STR("[LetMeCraft] {} calling OnRequestEndQuick on ability={} owner={} avatar={} root={} distanceSquared={}.\n"),
-            source,
-            object_name(candidate.ability),
-            candidate.owner_name,
-            candidate.avatar_name,
-            object_name(candidate.root_task),
-            candidate.distance_squared);
         candidate.ability->ProcessEvent(request_end_quick, &params);
-        Output::send<LogLevel::Verbose>(STR("[LetMeCraft] OnRequestEndQuick returned.\n"));
         return true;
     }
 
-    auto request_end_matching_crafter(const TCHAR* source, bool verbose) -> RequestResult
+    auto request_end_matching_crafter(const TCHAR* source) -> RequestResult
     {
-        const auto search = select_crafting_candidate(source, nullptr, nullptr, verbose);
+        const auto search = select_crafting_candidate(source, nullptr, nullptr);
         if (!search.found) { return {}; }
 
-        const auto called = call_request_end_quick(search.candidate, source);
+        const auto called = call_request_end_quick(search.candidate);
         return {called, search.candidate};
     }
 
@@ -2218,16 +1956,12 @@ private:
         auto* owner = find_owner(ability, root_task);
         auto* avatar = find_avatar(ability, root_task);
 
-        auto distance = std::numeric_limits<double>::max();
-        const auto player_location = read_actor_location(find_player_actor_cached());
-        const auto candidate_location = read_actor_location(find_candidate_actor(avatar, owner));
-        if (player_location.found && candidate_location.found)
-        {
-            distance = distance_squared(player_location.value, candidate_location.value);
-        }
-
+        // No distance: its only consumers were diagnostic logs. The two
+        // K2_GetActorLocation calls per 10Hz attempt + 1Hz kill-guard check
+        // bought nothing.
         return {true,
-                {ability, root_task, asc, owner, avatar, distance,
+                {ability, root_task, asc, owner, avatar,
+                 std::numeric_limits<double>::max(),
                  eviction.owner_name, eviction.avatar_name}};
     }
 
@@ -2269,14 +2003,6 @@ private:
         return nullptr;
     }
 
-    // Gothic AI is GAS-driven (UGameplayAbility_CharacterAI), not BehaviorTree-driven:
-    // GothicAIController has no BrainComponent (v0.6.1 logs: brain=<null> on every NPC),
-    // so the old StopLogic/RestartLogic path could never run and was removed.
-    auto pause_ai_for_hold(UObject* controller, const TCHAR* source) -> bool
-    {
-        return call_no_params_safely(controller, STR("BP_PauseMove"), source);
-    }
-
     // The activation targets the interactive nearest to the player and ignores both
     // the frozen sensor and m_FilterActor (v0.7.10-0.7.12 logs), and fighting the
     // NPC's movement lost every time (the routine overrides MoveToLocation within a
@@ -2290,13 +2016,7 @@ private:
     {
         auto* avatar = weak_get(eviction.avatar);
         auto* component = read_object(avatar, STR("m_InteractiveComponent"));
-        if (!component)
-        {
-            Output::send<LogLevel::Verbose>(
-                STR("[LetMeCraft] npc interaction toggle skipped: no m_InteractiveComponent on avatar={}.\n"),
-                eviction.avatar_name);
-            return false;
-        }
+        if (!component) { return false; }
 
         auto call = begin_call(component, STR("SetForceDisableInteraction"), STR("npc interaction toggle"));
         set_bool_param(call, STR("Value"), !enabled, STR("npc interaction toggle"));
@@ -2312,28 +2032,15 @@ private:
         }
 
         eviction.npc_interaction_disabled = !enabled;
-        Output::send<LogLevel::Verbose>(
-            STR("[LetMeCraft] npc interaction {} avatar={} via={}.\n"),
-            enabled ? STR("re-enabled") : STR("disabled"),
-            eviction.avatar_name,
-            called ? STR("SetForceDisableInteraction") : STR("direct flag write"));
         return true;
     }
 
-    auto issue_retreat(ActiveEviction& eviction, bool quiet = false) -> void
+    auto issue_retreat(ActiveEviction& eviction) -> void
     {
         auto* avatar = weak_get(eviction.avatar);
         auto* controller = weak_get(eviction.controller);
         const auto avatar_location = read_actor_location(avatar);
-        if (!avatar || !controller || !avatar_location.found)
-        {
-            Output::send<LogLevel::Verbose>(
-                STR("[LetMeCraft] retreat skipped owner={} avatar={} controller={}.\n"),
-                eviction.owner_name,
-                avatar ? STR("ok") : STR("gone"),
-                controller ? STR("ok") : STR("gone"));
-            return;
-        }
+        if (!avatar || !controller || !avatar_location.found) { return; }
 
         // Destination: behind the player's back (user redesign v0.8.0). The player
         // faces the station when pressing E, so the point on the station->player
@@ -2342,13 +2049,7 @@ private:
         if (!eviction.retreat_dest_known)
         {
             const auto player_location = read_actor_location(find_player_actor_cached());
-            if (!player_location.found)
-            {
-                Output::send<LogLevel::Verbose>(
-                    STR("[LetMeCraft] retreat skipped: no player location owner={}.\n"),
-                    eviction.owner_name);
-                return;
-            }
+            if (!player_location.found) { return; }
 
             auto dx = 0.0;
             auto dy = 0.0;
@@ -2380,7 +2081,7 @@ private:
             eviction.retreat_dest_known = true;
         }
 
-        issue_move_to_location(controller, eviction.retreat_dest, STR("retreat"), quiet);
+        issue_move_to_location(controller, eviction.retreat_dest, STR("retreat"));
     }
 
     auto claim_spot_once(UObject* subsystem, UObject* player_state, ActiveEviction& eviction) -> bool
@@ -2396,15 +2097,7 @@ private:
         set_param(verify, STR("Spot"), &eviction.spot, 8, STR("claim verify"));
         set_param(verify, STR("User"), &player_state, 8, STR("claim verify"));
         if (!invoke_call(verify, STR("claim verify"))) { return false; }
-        if (!get_bool_param(verify, STR("ReturnValue"), STR("claim verify"))) { return false; }
-
-        Output::send<LogLevel::Verbose>(
-            STR("[LetMeCraft] claim ok spot={} action={} user={} owner={}.\n"),
-            fname_to_text(eviction.spot),
-            fname_to_text(eviction.action),
-            object_name(player_state),
-            eviction.owner_name);
-        return true;
+        return get_bool_param(verify, STR("ReturnValue"), STR("claim verify"));
     }
 
     // HandleClaimerDestroyed drops every spot claim the NPC holds. Proven safe and
@@ -2414,7 +2107,7 @@ private:
     // begin_call is intentional: the FuncMap throw is specific to the PlayerController,
     // lookups on the InteractionSubsystem are proven working since v0.7.0.
     auto force_release_owner_claims(
-        UObject* subsystem, ActiveEviction& eviction, const TCHAR* context, bool quiet = false) -> bool
+        UObject* subsystem, ActiveEviction& eviction, const TCHAR* context) -> bool
     {
         auto* owner_actor = weak_get(eviction.owner);
         if (!subsystem || !owner_actor) { return false; }
@@ -2442,13 +2135,6 @@ private:
             invoke_call(release_avatar_uses, context);
         }
 
-        if (!quiet)
-        {
-            Output::send<LogLevel::Verbose>(
-                STR("[LetMeCraft] {} force-release: dropped all spot claims+uses of owner={}.\n"),
-                context,
-                eviction.owner_name);
-        }
         return true;
     }
 
@@ -2463,6 +2149,14 @@ private:
     auto select_routine_blocker(ActiveEviction& eviction, const CraftingCandidate& candidate) -> void
     {
         const auto activation_blocked = read_tag_container(candidate.ability, STR("ActivationBlockedTags"));
+
+        const auto chosen = choose_blocker_tag(activation_blocked);
+        eviction.blocker_tag = chosen.value;
+        eviction.blocker_known = chosen.found;
+        if (chosen.found) { return; }
+
+        // Failure diagnostics only: read the root task's containers so the
+        // warning lists every tag the next calibration could pick from.
         const auto cancel_if_gains = read_tag_container(candidate.root_task, STR("CancelIfCharacterGainsAnyOf"));
         auto owned_while_active = read_tag_container(candidate.root_task, STR("OwnedTagsWhileActive"));
         if (!owned_while_active.found)
@@ -2471,32 +2165,13 @@ private:
             owned_while_active = read_tag_container(candidate.root_task, STR("OwnedTagsToAddWhileActive"));
         }
         const auto blocked_owned = read_tag_container(candidate.root_task, STR("BlockedOwnedTags"));
-
-        const auto chosen = choose_blocker_tag(activation_blocked);
-        eviction.blocker_tag = chosen.value;
-        eviction.blocker_known = chosen.found;
-
-        if (chosen.found)
-        {
-            Output::send<LogLevel::Verbose>(
-                STR("[LetMeCraft] routine blocker selected tag={} owner={} activationBlocked={} cancelIfGains={} ownedWhileActive={} blockedOwned={}.\n"),
-                fname_to_text(eviction.blocker_tag),
-                eviction.owner_name,
-                tags_to_text(activation_blocked),
-                tags_to_text(cancel_if_gains),
-                tags_to_text(owned_while_active),
-                tags_to_text(blocked_owned));
-        }
-        else
-        {
-            Output::send<LogLevel::Warning>(
-                STR("[LetMeCraft] no safe blocker tag - running without one (v0.8.15 behavior). ActivationBlockedTags={} CancelIfCharacterGainsAnyOf={} OwnedTagsWhileActive={} BlockedOwnedTags={} owner={}.\n"),
-                tags_to_text(activation_blocked),
-                tags_to_text(cancel_if_gains),
-                tags_to_text(owned_while_active),
-                tags_to_text(blocked_owned),
-                eviction.owner_name);
-        }
+        Output::send<LogLevel::Warning>(
+            STR("[LetMeCraft] no safe blocker tag - running without one (v0.8.15 behavior). ActivationBlockedTags={} CancelIfCharacterGainsAnyOf={} OwnedTagsWhileActive={} BlockedOwnedTags={} owner={}.\n"),
+            tags_to_text(activation_blocked),
+            tags_to_text(cancel_if_gains),
+            tags_to_text(owned_while_active),
+            tags_to_text(blocked_owned),
+            eviction.owner_name);
     }
 
     auto apply_routine_blocker(ActiveEviction& eviction) -> void
@@ -2504,23 +2179,13 @@ private:
         if (!eviction.blocker_known || eviction.blocker_applied) { return; }
 
         auto* asc = weak_get(eviction.asc);
-        if (!asc)
-        {
-            Output::send<LogLevel::Verbose>(
-                STR("[LetMeCraft] routine blocker skipped: ASC unavailable owner={}.\n"),
-                eviction.owner_name);
-            return;
-        }
+        if (!asc) { return; }
 
         auto call = begin_call(asc, STR("AddTag"), STR("routine blocker apply"));
         set_param(call, STR("NewTag"), &eviction.blocker_tag, 8, STR("routine blocker apply"));
         if (!invoke_call(call, STR("routine blocker apply"))) { return; }
 
         eviction.blocker_applied = true;
-        Output::send<LogLevel::Verbose>(
-            STR("[LetMeCraft] routine blocker applied tag={} owner={}.\n"),
-            fname_to_text(eviction.blocker_tag),
-            eviction.owner_name);
     }
 
     // Single funnel for tag removal - called from EVERY eviction exit path
@@ -2537,10 +2202,6 @@ private:
         {
             // The ASC died with its world/actor; the tag died with it.
             eviction.blocker_applied = false;
-            Output::send<LogLevel::Verbose>(
-                STR("[LetMeCraft] routine blocker not removed: ASC gone reason={} owner={}.\n"),
-                reason,
-                eviction.owner_name);
             return;
         }
 
@@ -2558,11 +2219,6 @@ private:
         }
 
         eviction.blocker_applied = false;
-        Output::send<LogLevel::Verbose>(
-            STR("[LetMeCraft] routine blocker removed tag={} owner={} reason={}.\n"),
-            fname_to_text(eviction.blocker_tag),
-            eviction.owner_name,
-            reason);
     }
 
     auto try_claim_spot(ActiveEviction& eviction, bool allow_force_release) -> bool
@@ -2648,74 +2304,28 @@ private:
         const auto can_be_used = read_bool(component, STR("m_CanBeUsed"));
         const auto force_disabled = read_bool(component, STR("m_ForceDisableInteraction"));
 
-        auto usable_call = begin_call(component, STR("IsUsable"), STR("station usable"));
-        const auto is_usable = invoke_call(usable_call, STR("station usable")) &&
-                               get_bool_param(usable_call, STR("ReturnValue"), STR("station usable"));
-
-        const auto needs_fix = (is_being_used.found && is_being_used.value) ||
-                               (force_disabled.found && force_disabled.value);
-        if (needs_fix || eviction.player_use_attempts <= 2 || eviction.player_use_attempts % 10 == 0)
-        {
-            const auto flag_text = [](const BoolRead& flag) {
-                return !flag.found ? STR("?") : flag.value ? STR("true") : STR("false");
-            };
-            // The component's own interact radii decide whether the player can be
-            // sensed at all from where they stand - log them to settle the
-            // "is 1.9-2.6m even inside the small station's range" question.
-            const auto read_distance = [&](const TCHAR* function_name) -> double {
-                auto distance_call = begin_call(component, function_name, STR("station usable"));
-                if (!invoke_call(distance_call, STR("station usable"))) { return -1.0; }
-                auto* property = find_call_property(distance_call, STR("ReturnValue"), 4, STR("station usable"));
-                if (!property) { return -1.0; }
-                float value{};
-                std::memcpy(&value, distance_call.params.data() + property->GetOffset_Internal(), sizeof(value));
-                return static_cast<double>(value);
-            };
-            Output::send<LogLevel::Verbose>(
-                STR("[LetMeCraft] station state attempt={} isUsable={} isBeingUsed={} canBeUsed={} forceDisable={} interactDist={} closeDist={} farDist={} spot={}.\n"),
-                eviction.player_use_attempts,
-                is_usable ? STR("true") : STR("false"),
-                flag_text(is_being_used),
-                flag_text(can_be_used),
-                flag_text(force_disabled),
-                read_distance(STR("GetPlayerInteractDistance")),
-                read_distance(STR("GetPlayerCloseInteractDistance")),
-                read_distance(STR("GetPlayerFarInteractDistance")),
-                fname_to_text(eviction.spot));
-        }
-
         if (is_being_used.found && is_being_used.value)
         {
             auto call = begin_call(component, STR("SetIsBeingUsed"), STR("station usable"));
             set_bool_param(call, STR("Value"), false, STR("station usable"));
-            const auto called = invoke_call(call, STR("station usable"));
-            if (!called)
+            if (!invoke_call(call, STR("station usable")))
             {
                 auto* property = CastField<FBoolProperty>(
                     component->GetPropertyByNameInChain(STR("m_IsBeingUsed")));
                 if (property) { property->SetPropertyValueInContainer(component, false); }
             }
-            Output::send<LogLevel::Verbose>(
-                STR("[LetMeCraft] station SetIsBeingUsed(false) applied spot={} via={}.\n"),
-                fname_to_text(eviction.spot),
-                called ? STR("SetIsBeingUsed") : STR("direct flag write"));
         }
 
         if (force_disabled.found && force_disabled.value)
         {
             auto call = begin_call(component, STR("SetForceDisableInteraction"), STR("station usable"));
             set_bool_param(call, STR("Value"), false, STR("station usable"));
-            const auto called = invoke_call(call, STR("station usable"));
-            if (!called)
+            if (!invoke_call(call, STR("station usable")))
             {
                 auto* property = CastField<FBoolProperty>(
                     component->GetPropertyByNameInChain(STR("m_ForceDisableInteraction")));
                 if (property) { property->SetPropertyValueInContainer(component, false); }
             }
-            Output::send<LogLevel::Verbose>(
-                STR("[LetMeCraft] station SetForceDisableInteraction(false) applied spot={} via={}.\n"),
-                fname_to_text(eviction.spot),
-                called ? STR("SetForceDisableInteraction") : STR("direct flag write"));
         }
 
         if (can_be_used.found && !can_be_used.value && eviction.player_use_attempts <= 2)
@@ -2784,27 +2394,8 @@ private:
             // Mark done even when no walking was needed (E pressed up close) -
             // the arrival gate keys off this flag and must not sit out the
             // whole grace in that case.
-            if (!eviction.approach_done)
-            {
-                eviction.approach_done = true;
-                if (eviction.approach_started)
-                {
-                    Output::send<LogLevel::Verbose>(
-                        STR("[LetMeCraft] approach done distance={} spot={}.\n"),
-                        std::sqrt(distance_2d_squared),
-                        fname_to_text(eviction.spot));
-                }
-            }
+            eviction.approach_done = true;
             return;
-        }
-
-        if (!eviction.approach_started)
-        {
-            eviction.approach_started = true;
-            Output::send<LogLevel::Verbose>(
-                STR("[LetMeCraft] approach started distance={} spot={}.\n"),
-                std::sqrt(distance_2d_squared),
-                fname_to_text(eviction.spot));
         }
 
         const auto length = std::sqrt(distance_2d_squared);
@@ -2837,15 +2428,7 @@ private:
         auto* asc = read_object(player_state, STR("AbilitySystemComponent"));
         auto* ability_instance = find_player_interact_ability_instance(player_state);
         auto* ability_class = ability_instance ? ability_instance->GetClassPrivate() : nullptr;
-        if (!station || !asc || !ability_class)
-        {
-            Output::send<LogLevel::Verbose>(
-                STR("[LetMeCraft] player use skipped: station={} asc={} abilityClass={}.\n"),
-                station ? STR("ok") : STR("missing"),
-                asc ? STR("ok") : STR("missing"),
-                ability_class ? object_name(ability_class) : StringType{STR("<missing>")});
-            return false;
-        }
+        if (!station || !asc || !ability_class) { return false; }
 
         // Same-tick combo: cancel the NPC's reacquired crafting ability, drop its spot
         // claims and activate the player's interaction inside ONE game-thread tick.
@@ -2860,7 +2443,6 @@ private:
         // free spot made the combo skip its cancels produced 10-80 straight
         // activated=false over 1-9 seconds.
         {
-            auto request_end_called = false;
             // Evaluate the cached ability instead of a full-object scan; the
             // scan remains only as a fallback for a dead weak ptr (unseen so
             // far - the instance survives the whole eviction in every log).
@@ -2871,7 +2453,6 @@ private:
                     STR("player use combo"),
                     &eviction.owner_name,
                     &eviction.avatar_name,
-                    false,
                     false);
                 if (search.found)
                 {
@@ -2887,41 +2468,20 @@ private:
                 // reverted: it eased the pressure that made sticky routines
                 // give up - Kharim went 0-for-5 windows under it after winning
                 // on the 3rd window without it).
-                request_end_called = call_request_end_quick(search.candidate, STR("player use combo"));
+                call_request_end_quick(search.candidate);
             }
 
             if (!eviction.has_claim)
             {
-                const auto released = force_release_owner_claims(
-                    find_interaction_subsystem(), eviction, STR("player use combo"),
-                    eviction.combo_release_logged);
-                if (released) { eviction.combo_release_logged = true; }
+                force_release_owner_claims(
+                    find_interaction_subsystem(), eviction, STR("player use combo"));
 
                 // With an unknown spot freeness cannot be verified - proceed
-                // anyway, same as the v0.7.4 gate did.
-                const auto spot_free = !eviction.spot_known || is_spot_unclaimed(eviction.spot);
-
-                // Same gate as the station-attempt log: a stuck-spot war printed
-                // one of these per 100ms attempt in the v0.8.11 session (75
-                // lines); spot_free stays loud - it is the transition that
-                // matters.
-                const auto combo_loud = eviction.player_use_attempts <= 2 ||
-                                        eviction.player_use_attempts % 5 == 0 || spot_free;
-                if ((request_end_called || !spot_free) && combo_loud)
-                {
-                    Output::send<LogLevel::Verbose>(
-                        STR("[LetMeCraft] player use combo attempt={} requestEnd={} released={} spotFree={} spot={}.\n"),
-                        eviction.player_use_attempts,
-                        request_end_called ? STR("true") : STR("false"),
-                        released ? STR("true") : STR("false"),
-                        spot_free ? STR("true") : STR("false"),
-                        eviction.spot_known ? fname_to_text(eviction.spot) : StringType{STR("<unknown>")});
-                }
-
-                // Still held: retry. After a cancel the fast (100ms) recheck
-                // lands inside the release window (the claim frees ~100ms after
-                // a cancel, the routine re-claims in ~250ms - v0.8.1 log).
-                if (!spot_free) { return false; }
+                // anyway, same as the v0.7.4 gate did. Still held: retry. After
+                // a cancel the fast (100ms) recheck lands inside the release
+                // window (the claim frees ~100ms after a cancel, the routine
+                // re-claims in ~250ms - v0.8.1 log).
+                if (eviction.spot_known && !is_spot_unclaimed(eviction.spot)) { return false; }
             }
         }
 
@@ -2977,14 +2537,6 @@ private:
                             eviction.approach_stop_distance - kApproachStopShrinkStep);
                         eviction.approach_done = false;
                     }
-                    if (eviction.player_use_attempts <= 2 || eviction.player_use_attempts % 5 == 0)
-                    {
-                        Output::send<LogLevel::Verbose>(
-                            STR("[LetMeCraft] activation gated attempt={}: sensor nearest={} != station, approachStop={}.\n"),
-                            eviction.player_use_attempts,
-                            object_name(nearest),
-                            eviction.approach_stop_distance);
-                    }
                     return false;
                 }
             }
@@ -3015,11 +2567,6 @@ private:
                     distance_squared(avatar_location.value, player_location.value);
                 if (npc_distance_squared < kNpcClearDistanceSquared)
                 {
-                    Output::send<LogLevel::Verbose>(
-                        STR("[LetMeCraft] player use waiting attempt={}: evicted NPC within clear radius (npcDistanceSquared={} < {}).\n"),
-                        eviction.player_use_attempts,
-                        npc_distance_squared,
-                        kNpcClearDistanceSquared);
                     const auto now = Clock::now();
                     if (now >= eviction.re_retreat_at)
                     {
@@ -3068,44 +2615,7 @@ private:
         if (!invoke_call(call, STR("player use"))) { return false; }
 
         const auto activated = get_bool_param(call, STR("ReturnValue"), STR("player use"));
-        if (activated || eviction.player_use_attempts <= 2 || eviction.player_use_attempts % 5 == 0)
-        {
-            Output::send<LogLevel::Verbose>(
-                STR("[LetMeCraft] player use station attempt={} activated={} abilityClass={} spot={}.\n"),
-                eviction.player_use_attempts,
-                activated ? STR("true") : STR("false"),
-                object_name(ability_class),
-                fname_to_text(eviction.spot));
-        }
-        if (!activated)
-        {
-            // Sensor-eye diagnostic (~1Hz at the burst cadence): does the player's
-            // own interaction sensor consider anything interactable right now? If
-            // canInteract=false / nearest=null while the spot is FREE, the blocker
-            // is the game's requirement check, not the routine's churn - that is
-            // the plan-C trigger (UseSpot/gameplay-event with explicit target).
-            if (eviction.player_use_attempts % 10 == 0)
-            {
-                if (auto* sensor = find_player_sensor())
-                {
-                    auto can_call = begin_call(sensor, STR("CanInteract"), STR("player use diag"));
-                    const auto can_interact = invoke_call(can_call, STR("player use diag")) &&
-                                              get_bool_param(can_call, STR("ReturnValue"), STR("player use diag"));
-                    auto nearest_call = begin_call(sensor, STR("GetNearestInteraction"), STR("player use diag"));
-                    UObject* nearest = nullptr;
-                    if (invoke_call(nearest_call, STR("player use diag")))
-                    {
-                        nearest = get_object_param(nearest_call, STR("ReturnValue"), STR("player use diag"));
-                    }
-                    Output::send<LogLevel::Verbose>(
-                        STR("[LetMeCraft] player use diag attempt={} canInteract={} nearest={}.\n"),
-                        eviction.player_use_attempts,
-                        can_interact ? STR("true") : STR("false"),
-                        object_name(nearest));
-                }
-            }
-            return false;
-        }
+        if (!activated) { return false; }
 
         // Verify what the interaction actually targeted: if the activation re-picked
         // its own target (the NPC -> dialogue, or a closer station), end it right
@@ -3134,164 +2644,12 @@ private:
             if (actual_target == weak_get(eviction.avatar) && now >= eviction.re_retreat_at)
             {
                 eviction.re_retreat_at = now + kReRetreatInterval;
-                Output::send<LogLevel::Verbose>(
-                    STR("[LetMeCraft] re-retreating NPC: it stole the interaction target.\n"));
                 run_guarded(STR("re-retreat"), [&] { issue_retreat(eviction); });
             }
             return false;
         }
 
-        Output::send<LogLevel::Verbose>(
-            STR("[LetMeCraft] player use target verified station={}.\n"),
-            object_name(station));
         return true;
-    }
-
-    auto log_claim_fail_reasons(ActiveEviction& eviction) -> void
-    {
-        auto* subsystem = find_interaction_subsystem();
-        auto* player_state = find_player_state();
-        if (!subsystem || !player_state) { return; }
-
-        auto call = begin_call(subsystem, STR("DebugCanPawnClaimSpotFailReason"), STR("claim debug"));
-        set_param(call, STR("Spot"), &eviction.spot, 8, STR("claim debug"));
-        set_param(call, STR("PotentialUser"), &player_state, 8, STR("claim debug"));
-        set_param(call, STR("Action"), &eviction.action, 8, STR("claim debug"));
-        if (!invoke_call(call, STR("claim debug"))) { return; }
-
-        struct RawArray
-        {
-            void* data{};
-            int32_t num{};
-            int32_t max{};
-        };
-        struct RawString
-        {
-            const wchar_t* data{};
-            int32_t num{};
-            int32_t max{};
-        };
-
-        RawArray reasons{};
-        if (!get_param(call, STR("ReturnValue"), &reasons, 16, STR("claim debug"))) { return; }
-
-        Output::send<LogLevel::Warning>(
-            STR("[LetMeCraft] claim gave up spot={} action={} reasonCount={}.\n"),
-            fname_to_text(eviction.spot),
-            fname_to_text(eviction.action),
-            reasons.num);
-
-        const auto count = (reasons.data && reasons.num > 0) ? (reasons.num < 8 ? reasons.num : 8) : 0;
-        for (auto index = 0; index < count; ++index)
-        {
-            const auto* element = static_cast<const RawString*>(reasons.data) + index;
-            if (element->data && element->num > 0)
-            {
-                Output::send<LogLevel::Warning>(
-                    STR("[LetMeCraft]   claim fail reason: {}\n"),
-                    StringType{element->data, static_cast<size_t>(element->num - 1)});
-            }
-        }
-        // The returned TArray<FString> buffers are intentionally leaked: rare
-        // diagnostic path, freeing them would require the engine allocator.
-    }
-
-    auto read_world_time_seconds() -> double
-    {
-        auto* world_context = find_player_actor_cached();
-        auto* function = UObjectGlobals::StaticFindObject<UFunction*>(
-            nullptr, nullptr, STR("/Script/Engine.GameplayStatics:GetTimeSeconds"));
-        auto* statics = UObjectGlobals::StaticFindObject<UObject*>(
-            nullptr, nullptr, STR("/Script/Engine.Default__GameplayStatics"));
-        if (!world_context || !function || !statics) { return -1.0; }
-
-        auto call = begin_call_with_function(statics, function, STR("world time"));
-        set_param(call, STR("WorldContextObject"), &world_context, 8, STR("world time"));
-        if (!invoke_call(call, STR("world time"))) { return -1.0; }
-
-        double seconds{};
-        if (!get_param(call, STR("ReturnValue"), &seconds, 8, STR("world time"))) { return -1.0; }
-        return seconds;
-    }
-
-    // Locates the live FInteractionSpot value inside InteractionSubsystem.SpotsByName
-    // (TMap<FName, FInteractionSpot>: key 8/4, value 0x118/8 — verified in the SDK dump).
-    auto find_spot_record(UObject* subsystem, const FName& spot) -> unsigned char*
-    {
-        auto* property = CastField<FMapProperty>(subsystem->GetPropertyByNameInChain(STR("SpotsByName")));
-        if (!property) { return nullptr; }
-
-        auto* map = property->ContainerPtrToValuePtr<FScriptMap>(subsystem);
-        if (!map) { return nullptr; }
-
-        const auto layout = FScriptMap::GetScriptLayout(8, 4, kInteractionSpotValueSize, 8);
-        for (int32_t index = 0, max_index = map->GetMaxIndex(); index < max_index; ++index)
-        {
-            if (!map->IsValidIndex(index)) { continue; }
-
-            auto* pair = static_cast<unsigned char*>(map->GetData(index, layout));
-            if (std::memcmp(pair, &spot, 8) != 0) { continue; }
-
-            return pair + layout.ValueOffset;
-        }
-
-        return nullptr;
-    }
-
-    auto apply_spot_cooldown(ActiveEviction& eviction) -> bool
-    {
-        auto* subsystem = find_interaction_subsystem();
-        if (!subsystem) { return false; }
-
-        auto* record = find_spot_record(subsystem, eviction.spot);
-        if (!record)
-        {
-            Output::send<LogLevel::Warning>(
-                STR("[LetMeCraft] spot cooldown: record not found spot={}.\n"),
-                fname_to_text(eviction.spot));
-            return false;
-        }
-
-        const auto now_seconds = read_world_time_seconds();
-        if (now_seconds < 0.0) { return false; }
-
-        auto* cooldown_duration = reinterpret_cast<float*>(record + kSpotCooldownDurationOffset);
-        auto* last_time_used = reinterpret_cast<float*>(record + kSpotLastTimeUsedOffset);
-        eviction.saved_cooldown_duration = *cooldown_duration;
-        eviction.saved_last_time_used = *last_time_used;
-        *cooldown_duration = kSpotCooldownSeconds;
-        *last_time_used = static_cast<float>(now_seconds);
-        eviction.has_cooldown_write = true;
-
-        Output::send<LogLevel::Verbose>(
-            STR("[LetMeCraft] spot cooldown applied spot={} duration={} worldTime={} (was duration={} lastUsed={}).\n"),
-            fname_to_text(eviction.spot),
-            kSpotCooldownSeconds,
-            now_seconds,
-            eviction.saved_cooldown_duration,
-            eviction.saved_last_time_used);
-        return true;
-    }
-
-    auto restore_spot_cooldown(ActiveEviction& eviction) -> void
-    {
-        if (!eviction.has_cooldown_write) { return; }
-        eviction.has_cooldown_write = false;
-
-        auto* subsystem = find_interaction_subsystem();
-        if (!subsystem) { return; }
-
-        auto* record = find_spot_record(subsystem, eviction.spot);
-        if (!record) { return; }
-
-        *reinterpret_cast<float*>(record + kSpotCooldownDurationOffset) = eviction.saved_cooldown_duration;
-        *reinterpret_cast<float*>(record + kSpotLastTimeUsedOffset) = eviction.saved_last_time_used;
-
-        Output::send<LogLevel::Verbose>(
-            STR("[LetMeCraft] spot cooldown restored spot={} duration={} lastUsed={}.\n"),
-            fname_to_text(eviction.spot),
-            eviction.saved_cooldown_duration,
-            eviction.saved_last_time_used);
     }
 
     template <typename Callback>
@@ -3415,7 +2773,6 @@ private:
                     else if (eviction.claim_attempts >= kClaimMaxAttempts)
                     {
                         eviction.claim_gave_up = true;
-                        log_claim_fail_reasons(eviction);
                     }
                 });
             }
@@ -3534,18 +2891,7 @@ private:
                     kBehindHoldToleranceSquared)
             {
                 eviction.re_retreat_at = now + kReRetreatInterval;
-                // The routine fights the parking every second for up to 17s -
-                // log the first re-issue and every 5th, not all of them.
-                const auto loud = eviction.behind_hold_reissues % 5 == 0;
-                ++eviction.behind_hold_reissues;
-                if (loud)
-                {
-                    Output::send<LogLevel::Verbose>(
-                        STR("[LetMeCraft] behind-hold: NPC drifted off the parking point, re-issuing walk owner={} reissues={}.\n"),
-                        eviction.owner_name,
-                        eviction.behind_hold_reissues);
-                }
-                run_guarded(STR("behind-hold re-retreat"), [&] { issue_retreat(eviction, !loud); });
+                run_guarded(STR("behind-hold re-retreat"), [&] { issue_retreat(eviction); });
             }
         }
 
@@ -3569,24 +2915,17 @@ private:
                         STR("kill guard"),
                         &eviction.owner_name,
                         &eviction.avatar_name,
-                        false,
                         false);
                     if (search.found) { eviction.ability = search.candidate.ability; }
                 }
                 if (search.found)
                 {
-                    const auto request_end_called = call_request_end_quick(search.candidate, STR("kill guard"));
+                    call_request_end_quick(search.candidate);
                     // Also drop the claims the reacquired ability took: cancelling the
                     // ability alone leaves the token held, which is what starved the
                     // player-use poll on Kharim/Snaf in v0.7.4.
-                    const auto released = force_release_owner_claims(
+                    force_release_owner_claims(
                         find_interaction_subsystem(), eviction, STR("kill guard"));
-                    Output::send<LogLevel::Verbose>(
-                        STR("[LetMeCraft] kill guard: crafting reacquired owner={} requestEnd={} released={} claim={}.\n"),
-                        eviction.owner_name,
-                        request_end_called ? STR("true") : STR("false"),
-                        released ? STR("true") : STR("false"),
-                        eviction.has_claim ? STR("held") : STR("none"));
                 }
             });
         }
@@ -3612,64 +2951,6 @@ private:
                 m_evictions.erase(m_evictions.begin() + static_cast<std::ptrdiff_t>(index - 1));
             }
         }
-    }
-
-    auto schedule_post_check(const CraftingCandidate& candidate, Clock::time_point now) -> void
-    {
-        m_post_check_active = true;
-        m_post_check_started_at = now;
-        m_post_check_index = 0;
-        m_post_check_at = m_post_check_started_at + post_check_delay_for_index(m_post_check_index);
-        m_post_check_owner_name = candidate.owner_name;
-        m_post_check_avatar_name = candidate.avatar_name;
-    }
-
-    auto tick_post_check() -> void
-    {
-        if (!m_post_check_active) { return; }
-        if (Clock::now() < m_post_check_at) { return; }
-
-        m_post_check_active = false;
-        const auto label = post_check_label_for_index(m_post_check_index);
-        const auto search = select_crafting_candidate(
-            label,
-            &m_post_check_owner_name,
-            &m_post_check_avatar_name,
-            false,
-            false);
-
-        if (search.found)
-        {
-            Output::send<LogLevel::Warning>(
-                STR("[LetMeCraft] {}: target still has active crafting ability owner={} avatar={} ability={} root={} distanceSquared={}.\n"),
-                label,
-                m_post_check_owner_name,
-                m_post_check_avatar_name,
-                object_name(search.candidate.ability),
-                object_name(search.candidate.root_task),
-                search.candidate.distance_squared);
-        }
-        else
-        {
-            Output::send<LogLevel::Verbose>(
-                STR("[LetMeCraft] {}: target no longer has active nearby crafting ability owner={} avatar={}.\n"),
-                label,
-                m_post_check_owner_name,
-                m_post_check_avatar_name);
-        }
-
-        if (m_post_check_index < 2)
-        {
-            ++m_post_check_index;
-            m_post_check_at = m_post_check_started_at + post_check_delay_for_index(m_post_check_index);
-            m_post_check_active = true;
-            return;
-        }
-
-        m_post_check_owner_name.clear();
-        m_post_check_avatar_name.clear();
-        m_post_check_started_at = {};
-        m_post_check_index = 0;
     }
 
     auto poll_gamepad_y() -> void
@@ -3721,16 +3002,12 @@ private:
     HMODULE m_xinput_module{};
     XInputGetStateFn m_xinput_get_state{};
     Clock::time_point m_next_manual_request_time{};
-    Clock::time_point m_post_check_started_at{};
-    Clock::time_point m_post_check_at{};
     std::vector<ActiveEviction> m_evictions{};
     FWeakObjectPtr m_cached_subsystem{};
     FWeakObjectPtr m_cached_player_controller{};
     FWeakObjectPtr m_cached_player_state{};
     FWeakObjectPtr m_cached_player_sensor{};
     FWeakObjectPtr m_cached_player_interact_ability{};
-    StringType m_post_check_owner_name{};
-    StringType m_post_check_avatar_name{};
     StringType m_pending_manual_source{};
     std::mutex m_pending_request_mutex{};
     Unreal::Hook::GlobalCallbackId m_engine_tick_callback_id{};
@@ -3747,10 +3024,18 @@ private:
     Clock::time_point m_next_warmup_at{};
     FWeakObjectPtr m_set_ignore_move_input_function{};
     FWeakObjectPtr m_reset_ignore_move_input_function{};
-    int m_post_check_index{};
+    // Resolve-once weak caches for the spot/token /Script libraries:
+    // is_spot_unclaimed runs EVERY engine tick during the claim poll and used
+    // to pay 2x StaticFindObject per call. Same rationale as the move-lock
+    // warm-up caches above; like those they deliberately survive
+    // clear_transient_state (permanent /Script objects, the weak ptr
+    // re-resolves if one ever dies).
+    FWeakObjectPtr m_spot_unclaimed_function{};
+    FWeakObjectPtr m_spot_handle_library{};
+    FWeakObjectPtr m_token_unclaim_function{};
+    FWeakObjectPtr m_token_library{};
     bool m_xinput_checked{};
     bool m_gamepad_y_was_down{};
-    bool m_post_check_active{};
     bool m_has_pending_manual_request{};
 };
 
