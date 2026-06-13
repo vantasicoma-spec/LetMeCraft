@@ -188,9 +188,26 @@ The main calibration knobs live as constants near the top of
 
 ```text
 cpp/
-├── CMakeLists.txt        # wrapper project: RE-UE4SS + the mod
+├── CMakeLists.txt           # wrapper project: RE-UE4SS + the mod
 ├── LetMeCraft/
-│   ├── CMakeLists.txt    # the mod target (shared library, links UE4SS)
-│   └── dllmain.cpp       # the entire mod implementation
-└── RE-UE4SS/             # UE4SS checkout (not tracked; clone manually)
+│   ├── CMakeLists.txt       # the mod target (shared library, links UE4SS)
+│   ├── dllmain.cpp          # thin mod shell: input, hooks, tick dispatch, exports
+│   └── lmc/                 # the mod, split into cohesive components (header-only)
+│       ├── Common.hpp       # stateless utilities: reflection, UFunction calls,
+│       │                    #   geometry, GAS readers, constants, structs, run_guarded
+│       ├── GameObjects.hpp  # weak-cached game-object lookups (subsystem, player, sensor)
+│       ├── MovementLock.hpp  # player movement/jump lock + controller-function warm-up
+│       ├── PlayerSensor.hpp  # interaction-sensor pin/unfreeze
+│       ├── SpotClaims.hpp    # interaction-spot claim/token operations
+│       ├── CraftingScanner.hpp # find & cancel the occupied crafting ability
+│       ├── RoutineBlocker.hpp  # the GAS routine-blocker tag (apply/remove)
+│       └── EvictionManager.hpp # the eviction state machine (orchestrates the above)
+└── RE-UE4SS/                # UE4SS checkout (not tracked; clone manually)
 ```
+
+The code is organized as a thin `LetMeCraft` mod class (in `dllmain.cpp`) that owns
+the components in `lmc/` and forwards the UE4SS callbacks (keybind, engine tick, map
+load) to them. Each component is one focused class under `namespace lmc`; the bulk of
+the per-frame logic lives in `EvictionManager`, which holds references to the service
+components it coordinates. All compile into one translation unit (only `dllmain.cpp`
+is listed in CMake; the headers are `#include`d), so there is no build-system change.
