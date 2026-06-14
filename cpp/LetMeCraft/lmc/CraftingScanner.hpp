@@ -35,7 +35,15 @@ namespace lmc
             const auto has_target = (target_owner_name && !target_owner_name->empty()) ||
                                     (target_avatar_name && !target_avatar_name->empty());
 
+            // #1: the player's look direction, read once. Only for the manual trigger -
+            // kill-guard / combo re-finds (require_player_range==false) must keep
+            // targeting the same eviction no matter where the player is looking.
+            const auto view_forward = require_player_range
+                ? read_view_forward_2d(m_objects.find_player_controller_cached())
+                : ViewForwardRead{};
+
             CraftingCandidate best{};
+            double best_score = -std::numeric_limits<double>::max();
 
             for (auto* ability : abilities)
             {
@@ -86,29 +94,58 @@ namespace lmc
                     }
                 }
 
-                // The station window applies to the manual trigger only; the kill
-                // guard and the combo re-find the SAME eviction target regardless of
-                // where the player has wandered meanwhile. No minimum gate since
-                // v0.8.7: the mod auto-walks the player in, so a repeat E pressed
-                // point-blank must not be rejected.
+                // Manual-trigger gates (require_player_range only). The kill guard and
+                // the combo re-find the SAME eviction target regardless of where the
+                // player has wandered, so they skip the station window, the usability
+                // gate and the view-cone gate entirely and keep the legacy nearest pick.
+                auto candidate_score = -current_distance_squared;  // legacy: nearest wins
                 if (require_player_range && player_location.found)
                 {
-                    const auto station_location = read_actor_location(read_object(ability, STR("m_InteractiveActor")));
+                    auto* station_actor = read_object(ability, STR("m_InteractiveActor"));
+                    const auto station_location = read_actor_location(station_actor);
                     if (!station_location.found) { continue; }
+                    // No minimum gate since v0.8.7: the mod auto-walks the player in, so
+                    // a repeat E pressed point-blank must not be rejected.
                     if (distance_squared(player_location.value, station_location.value) >
                         kMaxStationDistanceSquared)
                     {
                         continue;
                     }
+
+                    // #2: skip stations the player cannot actually use (NPC-only ambient
+                    // activities, by Action tag) - otherwise the mod drags the player over
+                    // and burns 35 failed take attempts.
+                    if (!player_can_use_candidate(root_task)) { continue; }
+
+                    // #1: behave like the native Interact key - only engage when the NPC
+                    // is in the player's view cone, and #3: among several (a pan cluster)
+                    // prefer the one most centered in view. The cone is tested against the
+                    // NPC (candidate_location), NOT the station actor: the station pivot
+                    // can sit behind the working spot (cauldron logged dot=-0.995 while
+                    // correctly used). A read failure -> no cone gate, legacy nearest pick.
+                    if (view_forward.found)
+                    {
+                        const auto dot = view_dot_2d(view_forward, player_location.value, candidate_location.value);
+                        if (dot.valid)
+                        {
+                            if (dot.dot < kViewConeMinDot) { continue; }
+                            candidate_score = dot.dot;  // most-centered wins
+                        }
+                        else
+                        {
+                            candidate_score = 1.0;  // NPC on top of the player: treat as centered
+                        }
+                    }
                 }
 
-                if (!best.ability || current_distance_squared < best.distance_squared)
+                if (!best.ability || candidate_score > best_score)
                 {
                     if (!has_target)
                     {
                         owner_name = object_name(owner);
                         avatar_name = object_name(avatar);
                     }
+                    best_score = candidate_score;
                     best = {ability, root_task, asc, owner, avatar, current_distance_squared,
                             std::move(owner_name), std::move(avatar_name)};
                 }
@@ -195,6 +232,23 @@ namespace lmc
         }
 
     private:
+        // True if the player can actually perform this station's action - the gate that
+        // stops the mod dragging the player to NPC-only "ambient" stations it can never
+        // use (which otherwise burned 35 failed take attempts and raised crash exposure).
+        // Field-verified discriminator (calibration log 2026-06-14): every player-usable
+        // station carries an Action.Crafting.* tag (Forge / WhetStone / Cook.Cauldron /
+        // Cook.Pan), while NPC-only activities carry Action.Ambient.* (RoastScavenger /
+        // Leatherworking). The subsystem HasPawnAbilityToUseSpot and the static
+        // m_UsableByPlayer flag BOTH read false for every station on this build, so the
+        // action tag is the only reliable signal. Unknown action -> allow (never block a
+        // possibly-usable station on a read failure).
+        auto player_can_use_candidate(UObject* root_task) -> bool
+        {
+            const auto action = read_fname_at(root_task, STR("Action"));
+            if (!action.found) { return true; }
+            return contains_any(fname_to_text(action.value), {STR("Crafting")});
+        }
+
         auto find_ai_ability_from_candidate(const CraftingCandidate& candidate) -> UObject*
         {
             if (auto* ai_ability = read_object(candidate.owner, STR("AIAbility"))) { return ai_ability; }

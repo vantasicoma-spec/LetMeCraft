@@ -41,6 +41,9 @@ namespace lmc
                 run_guarded(STR("routine blocker clear"), [&] {
                     m_blocker.remove_routine_blocker(eviction, reason);
                 });
+                // Map-load/teardown: clear the interrupt flag WITHOUT calling into the AI on a
+                // possibly-dying world (allow_call=false). The live AI rebuilds from the save.
+                run_guarded(STR("resume routine clear"), [&] { m_claims.resume_routine(eviction, false); });
             }
             m_evictions.clear();
         }
@@ -51,6 +54,9 @@ namespace lmc
         {
             for (auto& eviction : m_evictions)
             {
+                // Crash recovery: clear any interrupt flag WITHOUT a ProcessEvent (allow_call=
+                // false) - the tick already faulted, so do not re-enter the AI on this world.
+                run_guarded(STR("crash recovery resume routine"), [&] { m_claims.resume_routine(eviction, false); });
                 if (!eviction.npc_interaction_disabled) { continue; }
                 run_guarded(STR("crash recovery npc re-enable"), [&] { set_npc_interaction_enabled(eviction, true); });
             }
@@ -90,7 +96,15 @@ namespace lmc
             if (auto* eviction = find_nearby_eviction())
             {
                 run_guarded(STR("refresh eviction"), [&] { refresh_eviction(*eviction, source, now); });
+                return;
             }
+
+            // Fires only on an actual press (cooldown-gated), so no spam: confirms the
+            // v0.9.1 gates rejected the press - no occupied crafting station that the
+            // player can use is in their view cone.
+            Output::send<LogLevel::Verbose>(
+                STR("[LetMeCraft] {} press ignored: no usable crafting station in view.\n"),
+                source);
         }
 
 
@@ -229,6 +243,16 @@ namespace lmc
             // which the per-tick claim poll can never win (the v0.8.15 35-cancel
             // wars on Kharim/Snaf).
             run_guarded(STR("routine blocker apply"), [&] { m_blocker.apply_routine_blocker(m_evictions.back()); });
+
+            // v1.1.0: TRANSIENT interrupt for the firmly-scheduled campfire-cook case
+            // (PAN_08/Shadow11). Pushes an empty routine onto the NPC's LIVE routine instance so
+            // its planner stops re-claiming the pan; the retreat + claim-poll then take it. Cook-
+            // only (forge/anvil/whetstone take cleanly on the proven path, untouched). Does NOT
+            // touch the saved DailyRoutineClass; resumed on every exit path. Fail-safe inside.
+            if (action.found && contains_any(fname_to_text(eviction.action), {STR("Cook")}))
+            {
+                run_guarded(STR("interrupt routine"), [&] { m_claims.interrupt_routine(m_evictions.back()); });
+            }
 
             run_guarded(STR("move lock"), [&] { m_movement.lock_player_movement(); });
 
@@ -491,7 +515,10 @@ namespace lmc
             auto* asc = read_object(player_state, STR("AbilitySystemComponent"));
             auto* ability_instance = m_objects.find_player_interact_ability_instance(player_state);
             auto* ability_class = ability_instance ? ability_instance->GetClassPrivate() : nullptr;
-            if (!station || !asc || !ability_class) { return false; }
+            if (!station || !asc || !ability_class)
+            {
+                return false;
+            }
 
             // Same-tick combo: cancel the NPC's reacquired crafting ability, drop its spot
             // claims and activate the player's interaction inside ONE game-thread tick.
@@ -505,6 +532,9 @@ namespace lmc
             // landed within ~150ms of a cancel, while burst windows where the
             // free spot made the combo skip its cancels produced 10-80 straight
             // activated=false over 1-9 seconds.
+            // v0.9.5: hoisted above the combo block so the stuck-claim claim-over below
+            // can flag the claim as acquired-this-tick for the handoff guard.
+            auto claimed_this_tick = false;
             {
                 // Evaluate the cached ability instead of a full-object scan; the
                 // scan remains only as a fallback for a dead weak ptr (unseen so
@@ -544,7 +574,32 @@ namespace lmc
                     // a cancel the fast (100ms) recheck lands inside the release
                     // window (the claim frees ~100ms after a cancel, the routine
                     // re-claims in ~250ms - v0.8.1 log).
-                    if (eviction.spot_known && !m_claims.is_spot_unclaimed(eviction.spot)) { return false; }
+                    if (eviction.spot_known && !m_claims.is_spot_unclaimed(eviction.spot))
+                    {
+                        // The spot still reads claimed after the force-release. A few NPCs
+                        // (PAN_08/Shadow11 while FIRMLY scheduled to cook there) hold a
+                        // persistent daily-routine reservation that no SAFE API yields: the
+                        // routine re-issues its interaction task ~every 250ms. Tried and
+                        // rejected: subsystem release, NotifyDoneWithAction/Idle,
+                        // CancelAllExceptRootState (all execute, claim stays); raising the
+                        // spot's NumAllowedUsers (template field, no effect); and swapping the
+                        // NPC's daily routine to Empty (worked in-session but rewrote the saved
+                        // routine class -> NPC loaded broken after a reload; withdrawn). So
+                        // PAN_08-when-firmly-scheduled is a documented known limitation. Still
+                        // try the player's OWN ClaimSpot - it grabs the spot the moment the
+                        // routine itself releases it, bounded by the 70-attempt out-wait window.
+                        run_guarded(STR("claim over stuck"), [&] {
+                            if (m_claims.try_claim_spot(eviction, true))
+                            {
+                                eviction.has_claim = true;
+                                claimed_this_tick = true;
+                            }
+                        });
+                        if (!eviction.has_claim)
+                        {
+                            return false;
+                        }
+                    }
                 }
             }
 
@@ -556,7 +611,6 @@ namespace lmc
             // The v0.8.9 log: the successful activation always lands on the attempt
             // right AFTER claim ok - the claim has to survive one world tick before
             // the game reads the spot as available to the player.
-            auto claimed_this_tick = false;
             if (eviction.spot_known && !eviction.has_claim)
             {
                 run_guarded(STR("inline claim"), [&] {
@@ -573,10 +627,15 @@ namespace lmc
             // (v0.7.10), and in a station cluster a NEIGHBOR can win it - Huno's
             // anvil lost to the adjacent forge at the 2.0m stop and the attempt=1
             // activation walked the player to the WRONG station (v0.8.14 log).
-            // No activation until the sensor reports OUR station; while a neighbor
-            // holds it, shrink the approach stop so the drive creeps the player in
-            // until the station is the closest pick. Placed BEFORE the handoff so
-            // a gated attempt keeps holding our claim (no release/re-claim churn).
+            // No activation while a DIFFERENT non-null interactive is nearest; while a
+            // neighbor holds it, shrink the approach stop so the drive creeps the player
+            // in until the station is the closest pick. Placed BEFORE the handoff so a
+            // gated attempt keeps holding our claim (no release/re-claim churn).
+            // v0.9.5: only gate on a non-null neighbor. A small station seen from the
+            // front/side returns nearest=<null> (PAN_08/Shadow11 - log 2026-06-14): there
+            // is no wrong target to grab, so let the pinned activation try; the
+            // target-mismatch verify below still ends a wrong grab. This is the
+            // "works from behind, breaks from front/side" case the user reported.
             if (auto* station_actor = weak_get(eviction.station))
             {
                 if (auto* sensor = m_objects.find_player_sensor())
@@ -587,7 +646,7 @@ namespace lmc
                     {
                         nearest = get_object_param(nearest_call, STR("ReturnValue"), STR("activation gate"));
                     }
-                    if (nearest != station_actor)
+                    if (nearest && nearest != station_actor)
                     {
                         // Keep the view aimed at the station - the live query is
                         // look-based and the pin block below does not run on a
@@ -675,10 +734,16 @@ namespace lmc
                 STR("player use"));
             set_param(call, STR("InAbilityToActivate"), &ability_class, 8, STR("player use"));
             set_bool_param(call, STR("bAllowRemoteActivation"), false, STR("player use"));
-            if (!invoke_call(call, STR("player use"))) { return false; }
+            if (!invoke_call(call, STR("player use")))
+            {
+                return false;
+            }
 
             const auto activated = get_bool_param(call, STR("ReturnValue"), STR("player use"));
-            if (!activated) { return false; }
+            if (!activated)
+            {
+                return false;
+            }
 
             // Verify what the interaction actually targeted: if the activation re-picked
             // its own target (the NPC -> dialogue, or a closer station), end it right
@@ -722,6 +787,13 @@ namespace lmc
             run_guarded(STR("routine blocker remove"), [&] {
                 m_blocker.remove_routine_blocker(eviction, reason);
             });
+            // Resume the NPC's daily routine. Issue the SwitchToDailyRoutine ProcessEvent ONLY
+            // if the avatar is still live: a dead avatar means the world is tearing down (finish
+            // raced a map-load), so we then just clear the flag instead of re-entering the AI on
+            // a dying world (the v0.8.11 crash class). resume_routine also is_usable-gates the
+            // ability itself, so this is belt-and-suspenders.
+            const auto avatar_live = weak_get(eviction.avatar) != nullptr;
+            run_guarded(STR("resume routine"), [&] { m_claims.resume_routine(eviction, avatar_live); });
 
             auto unclaimed = false;
             if (eviction.has_claim)
@@ -763,6 +835,9 @@ namespace lmc
                 run_guarded(STR("routine blocker remove"), [&] {
                     m_blocker.remove_routine_blocker(eviction, STR("avatar gone"));
                 });
+                // Avatar is gone -> world is tearing this NPC down; clear the interrupt flag
+                // WITHOUT a SwitchToDailyRoutine ProcessEvent (allow_call=false).
+                run_guarded(STR("resume routine"), [&] { m_claims.resume_routine(eviction, false); });
                 run_guarded(STR("drop cleanup"), [&] {
                     if (eviction.has_claim)
                     {

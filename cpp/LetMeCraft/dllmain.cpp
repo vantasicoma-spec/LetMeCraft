@@ -8,7 +8,7 @@ public:
     LetMeCraft() : CppUserModBase()
     {
         ModName = STR("LetMeCraft");
-        ModVersion = STR("0.9.0");
+        ModVersion = STR("1.1.0");
         ModDescription = STR("Moves the nearest NPC away from an occupied crafting station");
         ModAuthors = STR("Roma + Codex");
     }
@@ -24,7 +24,7 @@ public:
     auto on_unreal_init() -> void override
     {
         Output::send<LogLevel::Verbose>(
-            STR("[LetMeCraft] v0.9.0 loaded. Press E or gamepad Y near an occupied crafting NPC. Release cleanup: dead code & diagnostics removed, hot paths cached; behavior identical to v0.8.18.\n"));
+            STR("[LetMeCraft] v1.1.0 loaded. Press E (or gamepad Y) while looking at an occupied crafting station to evict the NPC and take it. Works on every station, including campfire pans/cauldrons: a cooking NPC is briefly switched to an empty AI state (transient, save-safe) so it stops re-claiming the spot, then its routine is restored when you are done.\n"));
 
         register_keydown_event(Input::Key::E, [this]() {
             queue_manual_request(STR("keyboard E"));

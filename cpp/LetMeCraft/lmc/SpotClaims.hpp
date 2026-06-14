@@ -117,12 +117,108 @@ namespace lmc
             invoke_call(release_owner_uses, context);
             if (auto* avatar_actor = weak_get(eviction.avatar))
             {
+                // v0.9.5: the CLAIM ledger can key on the avatar, not only the owner-state.
+                // PAN_08/Shadow11 held its spot claim under the avatar, so the owner-only
+                // HandleClaimerDestroyed above never freed it and the player-use combo read
+                // unclaimed=0 for all 35 attempts ("spot stuck", take failed). Release the
+                // avatar's claims too, mirroring the use-token release just below.
+                auto release_avatar_claims = begin_call(subsystem, STR("HandleClaimerDestroyed"), context);
+                set_param(release_avatar_claims, STR("Actor"), &avatar_actor, 8, context);
+                invoke_call(release_avatar_claims, context);
+
                 auto release_avatar_uses = begin_call(subsystem, STR("HandleUserDestroyed"), context);
                 set_param(release_avatar_uses, STR("Actor"), &avatar_actor, 8, context);
                 invoke_call(release_avatar_uses, context);
             }
 
             return true;
+        }
+
+        // v1.1.0 PAN_08 TRANSIENT interrupt. SWITCHES the cook NPC's active AI state to the
+        // engine's EMPTY daily routine via SwitchAIStateImmediatelyToClass on the ABILITY, so an
+        // empty routine becomes the live state - nothing is scheduled, the cook re-claim stops
+        // and the NPC idles (exactly the runtime effect the rc5 swap produced and the user
+        // confirmed worked, but WITHOUT writing the persistent DailyRoutineClass). rc6 confirmed
+        // DoInterruptStateOfClass(Empty) only pushes a temporary sub-state that completes
+        // instantly, so the hard schedule re-asserted (NPC kept twitching) - "switch the active
+        // state" is the right lever, "interrupt" is not. resume_routine restores the real routine
+        // via SwitchToDailyRoutine(). STRICTLY transient: never touches the saved DailyRoutineClass.
+        // All reflection via begin_native_call (dodges the IncludeInterfaces throw). FAIL-SAFE:
+        // any unresolved link -> no-op, routine_interrupted stays false, so resume stays a no-op.
+        auto interrupt_routine(ActiveEviction& eviction) -> void
+        {
+            if (eviction.routine_interrupted) { return; }  // one-shot
+
+            auto* npc_state = weak_get(eviction.owner);
+            if (!is_usable(npc_state)) { return; }
+            auto* ai_ability = read_object(npc_state, STR("AIAbility"));
+            if (!is_usable(ai_ability)) { return; }
+
+            // Verified benign target (rc5: resolves; rc6b: CharacterAIState subclass). As the
+            // ACTIVE state an empty routine idles the NPC; the swap proved it holds (does not
+            // complete) for the whole hold.
+            static constexpr const TCHAR* kInterruptStateClassPath = STR("/Script/Angelscript.DailyRoutine_Empty");
+            auto* state_class = UObjectGlobals::StaticFindObject<UClass*>(nullptr, nullptr, kInterruptStateClassPath);
+            if (!is_usable(state_class))
+            {
+                Output::send<LogLevel::Warning>(
+                    STR("[LetMeCraft] interrupt skipped: state class {} unresolved owner={}.\n"),
+                    kInterruptStateClassPath, eviction.owner_name);
+                return;
+            }
+
+            // SwitchAIStateImmediatelyToClass(StateClass) on the ability. parmsSize=16 = the
+            // 8-byte StateClass input + an 8-byte return value (the created state ptr, ignored);
+            // find_call_property locates StateClass by its own offset, so the layout is handled.
+            auto call = begin_native_call(
+                ai_ability,
+                STR("/Script/G1R.GameplayAbility_CharacterAI:SwitchAIStateImmediatelyToClass"),
+                STR("SwitchAIStateImmediatelyToClass"),
+                STR("interrupt routine"));
+            UObject* state_class_obj = static_cast<UObject*>(state_class);
+            set_param(call, STR("StateClass"), &state_class_obj, 8, STR("interrupt routine"));
+            if (!invoke_call(call, STR("interrupt routine"))) { return; }  // fail-safe: flag stays false
+
+            eviction.routine_interrupted = true;
+            Output::send<LogLevel::Verbose>(
+                STR("[LetMeCraft] routine interrupted (SwitchAIState) owner={} spot={} state={} - active state now empty.\n"),
+                eviction.owner_name, fname_to_text(eviction.spot), kInterruptStateClassPath);
+        }
+
+        // Restore normal planning. Called on EVERY eviction exit path. One-shot (clears the flag
+        // up front so a teardown can never re-fire or strand it). allow_call=false on the teardown
+        // paths (map-load clear / avatar-gone / SEH recovery): there the world/ability may be mid-
+        // destruction, so we ONLY clear the flag and do NOT issue the SwitchToDailyRoutine
+        // ProcessEvent (the interrupt is transient and the live AI is rebuilt from the save on
+        // reload, so skipping the call there is correct AND avoids a teardown-time GAS re-entry -
+        // the v0.8.11 crash class). allow_call=true ONLY on the healthy finish path.
+        auto resume_routine(ActiveEviction& eviction, bool allow_call) -> void
+        {
+            if (!eviction.routine_interrupted) { return; }
+            eviction.routine_interrupted = false;
+            if (!allow_call) { return; }
+
+            auto* npc_state = weak_get(eviction.owner);
+            if (!is_usable(npc_state)) { return; }
+            auto* ai_ability = read_object(npc_state, STR("AIAbility"));
+            if (!is_usable(ai_ability)) { return; }
+
+            auto call = begin_native_call(
+                ai_ability,
+                STR("/Script/G1R.GameplayAbility_CharacterAI:SwitchToDailyRoutine"),
+                STR("SwitchToDailyRoutine"),
+                STR("resume routine"));
+            if (invoke_call(call, STR("resume routine")))
+            {
+                Output::send<LogLevel::Verbose>(
+                    STR("[LetMeCraft] routine resumed owner={}.\n"), eviction.owner_name);
+            }
+            else
+            {
+                Output::send<LogLevel::Warning>(
+                    STR("[LetMeCraft] routine resume call failed owner={} - planner self-recovers via its own scheduling.\n"),
+                    eviction.owner_name);
+            }
         }
 
         auto try_claim_spot(ActiveEviction& eviction, bool allow_force_release) -> bool

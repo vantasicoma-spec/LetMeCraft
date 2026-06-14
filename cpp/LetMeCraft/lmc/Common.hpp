@@ -179,10 +179,20 @@ namespace lmc
     // the one window that ran past that (84 attempts vs Snaf's stuck cauldron
     // claim, v0.8.11 log 21:38) never succeeded, kept the player frozen the
     // full 10s, and the cancel/claim/activate churn preceded a game-side AV
-    // crash (G1R+0x1e59833, poisoned pointer 0x100000010). 35 = ~1.8x margin
-    // over the worst observed success; past it the spot is stuck and more
-    // hammering only raises the crash exposure.
-    constexpr int kPlayerUseMaxAttempts = 35;
+    // crash (G1R+0x1e59833, poisoned pointer 0x100000010). 35 was ~1.8x margin
+    // over the worst observed success.
+    // Raised 35 -> 70 (v0.9.5). The window out-waits a spot whose claim has not freed
+    // yet. For nearly every NPC the claim releases within a couple of attempts of the
+    // cancel/force-release; the wider cap is for the rare NPC whose daily routine is
+    // FIRMLY scheduled to a spot (PAN_08/Shadow11) and holds a reservation that no safe
+    // API yields - v0.9.5-rc2..v0.9.10-diag proved subsystem release,
+    // NotifyDoneWithAction/Idle and AI-state CancelAllExceptRootState all execute yet
+    // claimOwner stays 1; the take only succeeds when the routine itself moves on
+    // (claimOwner=0). 70 = 1000ms delay + 70x100ms = 8s gives that the longest
+    // reasonable window while staying inside the 10s move lock, then gives up
+    // (documented known-limitation). The v0.8.11 crash was post-success GAS churn the
+    // kill-guard now stops, not the attempt count.
+    constexpr int kPlayerUseMaxAttempts = 70;
     // When the take window closes WITHOUT a success the spot stays with the
     // NPC - holding it parked (and kill-guard-fighting its routine) for the
     // rest of the 17s is pure GAS churn against a station the player did not
@@ -221,6 +231,16 @@ namespace lmc
     // the conflict-free case.
     constexpr double kApproachMinStopDistance = 120.0;
     constexpr double kApproachStopShrinkStep = 20.0;
+    // v0.9.2 view gate: the manual E/Y press only fires when the occupied NPC is within
+    // this cone of the player's look direction (yaw plane), so the mod behaves like the
+    // native Interact key instead of grabbing by proximity. cos(0)=1.0 dead ahead;
+    // 0.0 = front hemisphere; 0.5 = 60 deg to either side. Calibrated against the NPC, not
+    // the station actor - the station pivot can sit behind the working spot (cauldron
+    // logged dot=-0.995 while correctly used, v0.7.10 pivot offset). v0.9.4: LOCKED at 0.5
+    // from field data (calibration log 2026-06-14) - intended presses (looking at the NPC)
+    // measured 0.85..0.99, look-away presses measured <=0.23, so 0.5 cleanly separates them
+    // with wide margin. Tunable: higher = must look more directly at the NPC.
+    constexpr double kViewConeMinDot = 0.5;
 
     struct BoolRead
     {
@@ -334,6 +354,11 @@ namespace lmc
         // ActivationBlockedTags; applied = it currently sits on the NPC's ASC.
         bool blocker_known{};
         bool blocker_applied{};
+        // v1.1.0 PAN_08 transient interrupt: one-shot guard. Set when SwitchAIStateImmediatelyToClass
+        // switched the cook NPC's active AI state to an empty routine; cleared by resume_routine
+        // (SwitchToDailyRoutine) on EVERY exit path. Transient runtime state only - it operates on
+        // the LIVE AI state, never the saved DailyRoutineClass.
+        bool routine_interrupted{};
     };
 
     using BYTE = Windows::BYTE;
@@ -894,6 +919,59 @@ namespace lmc
         const auto dy = a.Y() - b.Y();
         const auto dz = a.Z() - b.Z();
         return dx * dx + dy * dy + dz * dz;
+    }
+
+    // The player's view direction in the yaw plane, read straight from the controller's
+    // ControlRotation UPROPERTY. Deliberately NOT a UFunction call: name-based FuncMap
+    // lookups throw "Array failed invariants check" on this build's PlayerController
+    // chain (v0.7.4-0.7.6), so a plain property read is the only safe route. FRotator is
+    // three doubles on this LWC build (matches the SetControlRotation mirror in
+    // face_station). found=false when it can't be read - callers then skip the view gate.
+    struct ViewForwardRead
+    {
+        bool found{};
+        double x{};
+        double y{};
+    };
+
+    auto read_view_forward_2d(UObject* controller) -> ViewForwardRead
+    {
+        if (!is_usable(controller)) { return {}; }
+
+        struct FRotatorMirror
+        {
+            double pitch;
+            double yaw;
+            double roll;
+        };
+        auto* rotation = controller->GetValuePtrByPropertyNameInChain<FRotatorMirror>(STR("ControlRotation"));
+        if (!rotation) { return {}; }
+
+        const auto yaw_rad = rotation->yaw * (3.14159265358979323846 / 180.0);
+        return {true, std::cos(yaw_rad), std::sin(yaw_rad)};
+    }
+
+    // Cosine of the angle between the player's view forward and the (player -> station)
+    // direction, in the yaw plane. 1.0 = dead ahead, towards -1.0 = behind. valid=false
+    // when the view forward is unknown or the station is right on top of the player.
+    // Yaw-plane (2D) on purpose: it matches the horizontal peripheral-vision cosine and
+    // avoids pitch / eye-height false rejects on close stations.
+    struct ViewDot
+    {
+        bool valid{};
+        double dot{};
+    };
+
+    auto view_dot_2d(const ViewForwardRead& forward, const FVector& player, const FVector& station) -> ViewDot
+    {
+        if (!forward.found) { return {}; }
+
+        const auto dx = station.X() - player.X();
+        const auto dy = station.Y() - player.Y();
+        const auto length = std::sqrt(dx * dx + dy * dy);
+        if (length < 1.0) { return {}; }
+
+        return {true, (forward.x * dx + forward.y * dy) / length};
     }
 
     auto find_player_controller() -> UObject*
