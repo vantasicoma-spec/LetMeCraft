@@ -156,6 +156,64 @@ namespace lmc
             return {true, best};
         }
 
+        // Diagnostic only (no state change): when a manual press finds NO candidate, enumerate the
+        // active crafting abilities and the gate values for each, so a stuck station (e.g. the Snaf
+        // cauldron that "won't give up" and where E does nothing) reveals WHY it was rejected. The
+        // caller wraps this in invoke_with_seh - object_name on a recycled ability can fault.
+        auto diagnose_no_candidate(const TCHAR* source) -> void
+        {
+            if (!Unreal::IsInGameThreadRaw()) { return; }
+
+            std::vector<UObject*> abilities{};
+            UObjectGlobals::FindAllOf(STR("GameplayAbilityInteractFreePoint"), abilities);
+            const auto player_location = read_actor_location(m_objects.find_player_actor_cached());
+
+            const auto yn = [](bool found, bool value) -> const TCHAR* {
+                return found ? (value ? STR("Y") : STR("n")) : STR("?");
+            };
+
+            int logged = 0;
+            for (auto* ability : abilities)
+            {
+                if (logged >= 12 || !is_usable(ability)) { continue; }
+                auto* root_task = read_object(ability, STR("RootInteractionTask"));
+                if (!root_task || !root_task_is_crafting(root_task)) { continue; }
+
+                auto* avatar = find_avatar(ability, root_task);
+                auto* owner = find_owner(ability, root_task);
+                auto* candidate_actor = find_candidate_actor(avatar, owner);
+                const auto npc_loc = read_actor_location(candidate_actor);
+                int npc_dist = -1;
+                if (player_location.found && npc_loc.found)
+                {
+                    npc_dist = static_cast<int>(std::sqrt(distance_squared(player_location.value, npc_loc.value)));
+                }
+
+                const auto active = read_bool(ability, STR("bIsActive"));
+                const auto cancelable = read_bool(ability, STR("bIsCancelable"));
+                const auto end_requested = read_bool(ability, STR("bEndRequested"));
+                const auto action = read_fname_at(root_task, STR("Action"));
+
+                ++logged;
+                Output::send<LogLevel::Warning>(
+                    STR("[LetMeCraft] {} no-candidate diag: owner={} active={} cancelable={} endReq={} action={} npcDist={}m.\n"),
+                    source,
+                    object_name(owner),
+                    yn(active.found, active.value),
+                    yn(cancelable.found, cancelable.value),
+                    yn(end_requested.found, end_requested.value),
+                    action.found ? fname_to_text(action.value) : StringType{STR("?")},
+                    npc_dist);
+            }
+
+            if (logged == 0)
+            {
+                Output::send<LogLevel::Warning>(
+                    STR("[LetMeCraft] {} no-candidate diag: NO active+crafting interact ability exists right now (the NPC is likely idle / not crafting - e.g. a bricked or unstarted routine).\n"),
+                    source);
+            }
+        }
+
         auto call_request_end_quick(const CraftingCandidate& candidate) -> bool
         {
             if (!is_usable(candidate.ability)) { return false; }

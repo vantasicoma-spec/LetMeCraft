@@ -7,8 +7,10 @@
 #include <Unreal/CoreUObject/UObject/Class.hpp>
 #include <Unreal/CoreUObject/UObject/UnrealType.hpp>
 #include <Unreal/FField.hpp>
+#include <Unreal/FText.hpp>
 #include <Unreal/FWeakObjectPtr.hpp>
 #include <Unreal/Hooks/Hooks.hpp>
+#include <Unreal/Property/FTextProperty.hpp>
 #include <Unreal/Core/Containers/FString.hpp>
 #include <Unreal/NameTypes.hpp>
 #include <Unreal/UObject.hpp>
@@ -388,6 +390,25 @@ namespace lmc
 
     constexpr WORD kXInputGamepadY = 0x8000;
 
+    // user32 input-state polling (loaded dynamically like XInput, so no extra link dependency) used to
+    // detect the CURRENTLY active input device (keyboard/mouse vs gamepad) every frame.
+    struct CursorPoint { long x{}; long y{}; };
+    using GetAsyncKeyStateFn = SHORT(__stdcall*)(int);
+    using GetCursorPosFn = int(__stdcall*)(CursorPoint*);
+    constexpr int kVkLButton = 0x01;
+    constexpr int kVkRButton = 0x02;
+    constexpr int kVkMButton = 0x04;
+    constexpr int kVkShift = 0x10;
+    constexpr int kVkControl = 0x11;
+    constexpr int kVkSpace = 0x20;
+    constexpr int kVkW = 0x57;
+    constexpr int kVkA = 0x41;
+    constexpr int kVkS = 0x53;
+    constexpr int kVkD = 0x44;
+    // XInput thumbstick/trigger thresholds for "the player is actively using the pad".
+    constexpr int kStickActivity = 8000;       // ~ default left/right deadzones
+    constexpr int kTriggerActivity = 40;       // 0..255
+
     auto contains(const StringType& haystack, const StringViewType needle) -> bool
     {
         return haystack.find(needle) != StringType::npos;
@@ -516,6 +537,22 @@ namespace lmc
     {
         auto value = name;
         return value.ToString();
+    }
+
+    // Reads an FText property and returns its display string ALREADY localized to the game's
+    // current culture (FText::ToString resolves the active language). Empty string if the
+    // property is missing or not an FText. Used for the on-screen station-name prompt.
+    auto read_ftext(UObject* object, const TCHAR* property_name) -> StringType
+    {
+        if (!is_usable(object)) { return {}; }
+
+        auto* property = CastField<FTextProperty>(object->GetPropertyByNameInChain(property_name));
+        if (!property) { return {}; }
+
+        auto* value_ptr = property->ContainerPtrToValuePtr<FText>(object);
+        if (!value_ptr) { return {}; }
+
+        return value_ptr->ToString();
     }
 
     struct TagContainerRead

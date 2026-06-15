@@ -28,6 +28,18 @@ namespace lmc
 
         auto empty() const -> bool { return m_evictions.empty(); }
 
+        // True when one of the active evictions is already displacing this avatar. Read-only;
+        // used by the floating prompt to hide while an eviction on that NPC is in progress.
+        auto is_evicting_avatar(UObject* avatar) const -> bool
+        {
+            if (!avatar) { return false; }
+            for (const auto& eviction : m_evictions)
+            {
+                if (weak_get(eviction.avatar) == avatar) { return true; }
+            }
+            return false;
+        }
+
         // Drop all evictions, removing each routine-blocker tag first (the world that
         // owned the ASCs is being torn down). Called from clear_transient_state on
         // map load / game-state init / SEH recovery.
@@ -105,6 +117,13 @@ namespace lmc
             Output::send<LogLevel::Verbose>(
                 STR("[LetMeCraft] {} press ignored: no usable crafting station in view.\n"),
                 source);
+
+            // Diagnostic: log nearby crafting abilities + their gate values so a stuck station (the
+            // Snaf cauldron where E does nothing) reveals which gate rejected it. SEH-guarded because
+            // object_name on a recycled ability can fault - and there is no active eviction to protect
+            // here, so a fault must not reach the top-level guard.
+            SehCrashInfo diag_crash{};
+            invoke_with_seh([&] { m_scanner.diagnose_no_candidate(source); }, diag_crash);
         }
 
 
