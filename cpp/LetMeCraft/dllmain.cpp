@@ -65,18 +65,22 @@ private:
     auto queue_manual_request(const TCHAR* source) -> void
     {
         std::lock_guard lock{m_pending_request_mutex};
-        m_has_pending_manual_request = true;
         m_pending_manual_source = source;
+        m_has_pending_manual_request.store(true, std::memory_order_release);
     }
 
     auto take_manual_request(StringType& source) -> bool
     {
+        // Fast path every frame: a relaxed/acquire atomic read instead of locking the mutex when there is
+        // no pending request (the common case). Only lock once the flag is actually set.
+        if (!m_has_pending_manual_request.load(std::memory_order_acquire)) { return false; }
+
         std::lock_guard lock{m_pending_request_mutex};
-        if (!m_has_pending_manual_request) { return false; }
+        if (!m_has_pending_manual_request.load(std::memory_order_relaxed)) { return false; }
 
         source = m_pending_manual_source;
         m_pending_manual_source.clear();
-        m_has_pending_manual_request = false;
+        m_has_pending_manual_request.store(false, std::memory_order_release);
         return true;
     }
 
@@ -100,7 +104,7 @@ private:
 
         {
             std::lock_guard lock{m_pending_request_mutex};
-            m_has_pending_manual_request = false;
+            m_has_pending_manual_request.store(false, std::memory_order_release);
             m_pending_manual_source.clear();
         }
     }
@@ -205,7 +209,7 @@ private:
         {
             m_glyph_abilities_at = now;
             m_glyph_abilities.clear();
-            m_scanner.find_crafting_abilities(m_glyph_abilities);
+            m_scanner.find_crafting_abilities_for_prompt(m_glyph_abilities);
         }
         // 250ms (4Hz): pick the candidate from the cached list. The prompt appearing within a
         // quarter-second of looking at an NPC is imperceptible. A newly-started craft is noticed within
@@ -264,7 +268,7 @@ private:
     CraftingScanner m_scanner{m_objects};
     EvictionManager m_evictions_mgr{m_objects, m_movement, m_sensor, m_claims, m_scanner, m_blocker};
     GlyphOverlay m_glyph{m_objects};
-    bool m_has_pending_manual_request{};
+    std::atomic<bool> m_has_pending_manual_request{};
 };
 
 #define LET_ME_CRAFT_API __declspec(dllexport)

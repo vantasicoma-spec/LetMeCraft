@@ -24,6 +24,22 @@ namespace lmc
             UObjectGlobals::FindAllOf(STR("GameplayAbilityInteractFreePoint"), out);
         }
 
+        // Display-only fast path for the floating prompt (refreshed ~1.5s). FindAllOf is costly because
+        // it walks each object's whole super-struct chain comparing names; an EXACT class-pointer compare
+        // is one comparison per object (no chain walk) - ~5-10x cheaper per call. We keep the manual E
+        // path on find_crafting_abilities (FindAllOf) so eviction correctness never depends on this; the
+        // worst case here is the prompt not showing for an exotic subclass (E still works). Falls back to
+        // FindAllOf if the class can't be resolved, making it identical to the old behavior.
+        auto find_crafting_abilities_for_prompt(std::vector<UObject*>& out) -> void
+        {
+            auto* cls = resolve_interact_ability_class();
+            if (!cls) { find_crafting_abilities(out); return; }
+            UObjectGlobals::ForEachUObject([&](UObject* obj, int32_t, int32_t) {
+                if (obj && obj->GetClassPrivate() == cls && is_usable(obj)) { out.emplace_back(obj); }
+                return LoopAction::Continue;
+            });
+        }
+
         // prefetched: if non-null, evaluate THIS list instead of doing a fresh FindAllOf (the glyph
         // prompt passes its ~1.5s-refreshed cache). Stale pointers in it are safely dropped by the
         // per-ability is_usable() gate below.
@@ -305,6 +321,24 @@ namespace lmc
         }
 
     private:
+        // Resolve the interaction-ability UClass once (weak-cached). One-time name scan; thereafter a
+        // pointer in the cache. Used only by the display-only prompt fast path.
+        auto resolve_interact_ability_class() -> UClass*
+        {
+            if (auto* cached = weak_get(m_interact_ability_class)) { return static_cast<UClass*>(cached); }
+            UClass* found = nullptr;
+            const FName target{STR("GameplayAbilityInteractFreePoint"), FNAME_Find};
+            UObjectGlobals::ForEachUObject([&](UObject* obj, int32_t, int32_t) {
+                if (auto* cls = Cast<UClass>(obj))
+                {
+                    if (cls->GetNamePrivate() == target) { found = cls; return LoopAction::Break; }
+                }
+                return LoopAction::Continue;
+            });
+            if (found) { m_interact_ability_class = static_cast<UObject*>(found); }
+            return found;
+        }
+
         // True if the player can actually perform this station's action - the gate that
         // stops the mod dragging the player to NPC-only "ambient" stations it can never
         // use (which otherwise burned 35 failed take attempts and raised crash exposure).
@@ -350,5 +384,6 @@ namespace lmc
         }
 
         GameObjects& m_objects;
+        FWeakObjectPtr m_interact_ability_class{}; // cached UClass for the prompt's exact-class fast scan
     };
 }
