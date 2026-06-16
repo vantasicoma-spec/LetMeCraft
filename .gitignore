@@ -22,3 +22,6 @@ UECC-*/
 
 *.exe
 UE4SS_v*/
+
+# Release output (zip + staging produced by scripts/package.ps1)
+/dist/
