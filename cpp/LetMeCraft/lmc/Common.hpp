@@ -44,6 +44,20 @@ namespace lmc
 {
     using Clock = std::chrono::steady_clock;
 
+    // --- Debug logging gate -------------------------------------------------
+    // The mod's Verbose lines (and noisy diagnostic Warnings) are routed through LMC_DLOG so the
+    // release log stays quiet: only Error / rare one-shot operational Warnings / a single load line
+    // remain. Flip kDebugLog to true to re-enable the full diagnostic trail. With it false the
+    // LMC_DLOG body is dead-code-eliminated, so there is no runtime cost and nothing is written.
+    inline constexpr bool kDebugLog = false;
+}
+
+// Format string stays a literal (compile-time fmt checks); the call compiles either way but only
+// runs when kDebugLog is true. Defined at global scope so it works in every translation unit.
+#define LMC_DLOG(...) do { if (::lmc::kDebugLog) { Output::send<LogLevel::Verbose>(__VA_ARGS__); } } while (false)
+
+namespace lmc
+{
     // --- SEH backstop -------------------------------------------------------
     // run_guarded only covers C++ exceptions; an access violation is a hardware
     // (SEH) exception and kills the whole game (v0.7.14 in-game crash: AV in the

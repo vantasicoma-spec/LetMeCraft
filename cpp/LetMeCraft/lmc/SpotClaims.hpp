@@ -180,7 +180,7 @@ namespace lmc
             if (!invoke_call(call, STR("interrupt routine"))) { return; }  // fail-safe: flag stays false
 
             eviction.routine_interrupted = true;
-            Output::send<LogLevel::Verbose>(
+            LMC_DLOG(
                 STR("[LetMeCraft] routine interrupted (SwitchAIState) owner={} spot={} state={} - active state now empty.\n"),
                 eviction.owner_name, fname_to_text(eviction.spot), kInterruptStateClassPath);
         }
@@ -210,7 +210,7 @@ namespace lmc
                 STR("resume routine"));
             if (invoke_call(call, STR("resume routine")))
             {
-                Output::send<LogLevel::Verbose>(
+                LMC_DLOG(
                     STR("[LetMeCraft] routine resumed owner={}.\n"), eviction.owner_name);
             }
             else

@@ -195,7 +195,7 @@ namespace lmc
                 const auto action = read_fname_at(root_task, STR("Action"));
 
                 ++logged;
-                Output::send<LogLevel::Warning>(
+                LMC_DLOG(
                     STR("[LetMeCraft] {} no-candidate diag: owner={} active={} cancelable={} endReq={} action={} npcDist={}m.\n"),
                     source,
                     object_name(owner),
@@ -208,7 +208,7 @@ namespace lmc
 
             if (logged == 0)
             {
-                Output::send<LogLevel::Warning>(
+                LMC_DLOG(
                     STR("[LetMeCraft] {} no-candidate diag: NO active+crafting interact ability exists right now (the NPC is likely idle / not crafting - e.g. a bricked or unstarted routine).\n"),
                     source);
             }

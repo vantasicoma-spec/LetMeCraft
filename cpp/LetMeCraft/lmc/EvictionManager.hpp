@@ -114,7 +114,7 @@ namespace lmc
             // Fires only on an actual press (cooldown-gated), so no spam: confirms the
             // v0.9.1 gates rejected the press - no occupied crafting station that the
             // player can use is in their view cone.
-            Output::send<LogLevel::Verbose>(
+            LMC_DLOG(
                 STR("[LetMeCraft] {} press ignored: no usable crafting station in view.\n"),
                 source);
 
@@ -196,7 +196,7 @@ namespace lmc
                 }
             });
 
-            Output::send<LogLevel::Verbose>(
+            LMC_DLOG(
                 STR("[LetMeCraft] {} eviction refreshed owner={} avatar={} spot={} holdMs={}.\n"),
                 source,
                 eviction.owner_name,
@@ -284,7 +284,7 @@ namespace lmc
             run_guarded(STR("face station early"), [&] { face_station(station); });
 
             run_guarded(STR("eviction started log"), [&] {
-                Output::send<LogLevel::Verbose>(
+                LMC_DLOG(
                     STR("[LetMeCraft] {} eviction started owner={} avatar={} spot={} action={} controller={} station={} holdMs={} activeEvictions={}.\n"),
                     source,
                     candidate.owner_name,
@@ -828,7 +828,7 @@ namespace lmc
             m_movement.unlock_player_movement(reason);
             m_sensor.unfreeze_player_sensor(reason);
 
-            Output::send<LogLevel::Verbose>(
+            LMC_DLOG(
                 STR("[LetMeCraft] eviction finished reason={} owner={} avatar={} spot={} unclaim={}.\n"),
                 reason,
                 eviction.owner_name,
@@ -845,7 +845,7 @@ namespace lmc
             auto* avatar = weak_get(eviction.avatar);
             if (!avatar)
             {
-                Output::send<LogLevel::Verbose>(
+                LMC_DLOG(
                     STR("[LetMeCraft] eviction dropped: avatar gone owner={} avatar={}.\n"),
                     eviction.owner_name,
                     eviction.avatar_name);
@@ -933,7 +933,7 @@ namespace lmc
                 {
                     eviction.resume_at = now + kFailedTakeHoldTail;
                 }
-                Output::send<LogLevel::Verbose>(
+                LMC_DLOG(
                     STR("[LetMeCraft] auto-take window closed (reason={}) after {} attempts owner={} spot={} - take failed, parking shortened to {}s.\n"),
                     capped ? STR("attempt cap, spot stuck") : STR("timeout"),
                     eviction.player_use_attempts,
@@ -977,7 +977,7 @@ namespace lmc
                         m_movement.unlock_player_movement(STR("player took station"));
                         m_sensor.unfreeze_player_sensor(STR("player took station"));
                     });
-                    Output::send<LogLevel::Verbose>(
+                    LMC_DLOG(
                         STR("[LetMeCraft] player took station owner={} spot={} - NPC keeps parking until the hold expires.\n"),
                         eviction.owner_name,
                         eviction.spot_known ? fname_to_text(eviction.spot) : StringType{STR("<unknown>")});
