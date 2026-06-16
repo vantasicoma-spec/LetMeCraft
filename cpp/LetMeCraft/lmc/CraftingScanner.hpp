@@ -14,11 +14,25 @@ namespace lmc
     public:
         explicit CraftingScanner(GameObjects& objects) : m_objects(objects) {}
 
+        // The expensive primitive: FindAllOf walks the ENTIRE GUObjectArray and, for nearly every
+        // object, its whole super-struct chain (UObjectGlobals.cpp). Pulled out so callers can cache it.
+        // The manual E/Y path scans fresh per press (correctness); the continuous glyph-prompt path
+        // caches the result and refreshes it on a ~1.5s timer (see dllmain update_glyph), which removes
+        // the per-250ms full walk that was the residual stutter.
+        auto find_crafting_abilities(std::vector<UObject*>& out) -> void
+        {
+            UObjectGlobals::FindAllOf(STR("GameplayAbilityInteractFreePoint"), out);
+        }
+
+        // prefetched: if non-null, evaluate THIS list instead of doing a fresh FindAllOf (the glyph
+        // prompt passes its ~1.5s-refreshed cache). Stale pointers in it are safely dropped by the
+        // per-ability is_usable() gate below.
         auto select_crafting_candidate(
             const TCHAR* source,
             const StringType* target_owner_name,
             const StringType* target_avatar_name,
-            bool require_player_range = true) -> CraftingSearchResult
+            bool require_player_range = true,
+            const std::vector<UObject*>* prefetched = nullptr) -> CraftingSearchResult
         {
             if (!Unreal::IsInGameThreadRaw())
             {
@@ -28,8 +42,9 @@ namespace lmc
                 return {};
             }
 
-            std::vector<UObject*> abilities{};
-            UObjectGlobals::FindAllOf(STR("GameplayAbilityInteractFreePoint"), abilities);
+            std::vector<UObject*> scanned{};
+            if (!prefetched) { find_crafting_abilities(scanned); }
+            const std::vector<UObject*>& abilities = prefetched ? *prefetched : scanned;
 
             const auto player_location = read_actor_location(m_objects.find_player_actor_cached());
             const auto has_target = (target_owner_name && !target_owner_name->empty()) ||

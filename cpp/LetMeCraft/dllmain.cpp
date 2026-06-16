@@ -94,6 +94,8 @@ private:
         m_sensor.clear();
         m_evictions_mgr.clear(reason);
         m_glyph.clear();
+        m_glyph_abilities.clear(); // old world's ability pointers must not survive the map change
+        m_glyph_abilities_at = {};
         m_objects.clear();
 
         {
@@ -196,10 +198,22 @@ private:
     auto update_glyph() -> void
     {
         const auto now = Clock::now();
-        if (now - m_last_prompt_scan >= std::chrono::milliseconds(100))
+        // The crafting-ability list (a full FindAllOf walk of the whole UObject array + each object's
+        // super-chain) is the expensive part, so refresh it only ~1.5Hz and cache it. The 250ms
+        // candidate pick below evaluates that small cached list (a handful of abilities) - no full walk.
+        if (now - m_glyph_abilities_at >= std::chrono::milliseconds(1500))
+        {
+            m_glyph_abilities_at = now;
+            m_glyph_abilities.clear();
+            m_scanner.find_crafting_abilities(m_glyph_abilities);
+        }
+        // 250ms (4Hz): pick the candidate from the cached list. The prompt appearing within a
+        // quarter-second of looking at an NPC is imperceptible. A newly-started craft is noticed within
+        // <=1.5s (next cache refresh); a stopped craft hides within 250ms (gates re-read on the ability).
+        if (now - m_last_prompt_scan >= std::chrono::milliseconds(250))
         {
             m_last_prompt_scan = now;
-            auto probe = m_scanner.select_crafting_candidate(STR("glyph"), nullptr, nullptr, true);
+            auto probe = m_scanner.select_crafting_candidate(STR("glyph"), nullptr, nullptr, true, &m_glyph_abilities);
             if (probe.found)
             {
                 auto* candidate_avatar = probe.candidate.avatar;
@@ -240,6 +254,8 @@ private:
     StringType m_glyph_name{};
     const TCHAR* m_glyph_icon{kDefaultStationIcon};
     int m_glyph_frame_faults{};
+    std::vector<UObject*> m_glyph_abilities{}; // ~1.5s-refreshed crafting-ability cache for the prompt
+    Clock::time_point m_glyph_abilities_at{};
     InputDevice m_input{};
     MovementLock m_movement{m_objects};
     PlayerSensor m_sensor{m_objects};

@@ -7,16 +7,24 @@ namespace lmc
     // Owns all platform input polling for the mod: the gamepad-Y evict trigger (XInput) and the
     // live "which device is the player using right now" detection (XInput sticks/buttons/triggers vs
     // user32 keyboard/mouse). The glyph prompt shows E or a round Y based on is_gamepad(); the main
-    // mod consumes consume_y_press() to queue an eviction. Pulled out of dllmain so the main class
-    // stays about orchestration. Polled from on_update() on the UE4SS loop thread.
+    // mod consumes consume_y_press() to queue an eviction.
+    //
+    // PERFORMANCE: this is polled from on_update() which runs at the UE4SS event-loop rate (hundreds
+    // of Hz). XInputGetState on a DISCONNECTED slot does an internal device enumeration (~ms each), so
+    // polling all 4 slots every loop iteration froze the game (v1.2.0 stutter). Fixes: (1) the whole
+    // poll is throttled to ~30Hz; (2) a connected-slot cache means empty slots are touched only by a
+    // 1Hz re-scan (<=4 empty polls/sec instead of thousands) and the steady poll hits only connected
+    // slots (cheap). A keyboard-only player thus pays ~4 empty XInput polls/sec total.
     class InputDevice
     {
     public:
-        // Run every UE4SS loop tick: refresh the active-device flag and edge-detect the gamepad Y.
+        // Run from on_update() every UE4SS loop tick; internally throttled to ~30Hz.
         auto update() -> void
         {
-            detect_current_input_device();
-            poll_gamepad_y();
+            const auto now = Clock::now();
+            if (now < m_next_input_at) { return; }
+            m_next_input_at = now + kInputPollInterval;
+            poll(now);
         }
 
         // True while the last active device was the gamepad (selects the round Y glyph over E).
@@ -34,28 +42,88 @@ namespace lmc
         }
 
     private:
-        auto poll_gamepad_y() -> void
-        {
-            if (!ensure_xinput()) { return; }
+        static inline const Clock::duration kInputPollInterval = std::chrono::milliseconds(30);  // ~30Hz
+        static inline const Clock::duration kSlotRescanInterval = std::chrono::milliseconds(1000); // re-check empty slots 1Hz
 
+        // One combined poll: read each CONNECTED gamepad slot ONCE for both the Y rising-edge and the
+        // active-device detection, then the keyboard/mouse. Empty slots are touched only on the 1Hz
+        // re-scan. "Last active device wins"; the gamepad wins ties.
+        auto poll(Clock::time_point now) -> void
+        {
+            auto gamepad_active = false;
             auto y_is_down = false;
-            for (DWORD user_index = 0; user_index < 4; ++user_index)
+            if (ensure_xinput())
             {
-                XInputState state{};
-                if (m_xinput_get_state(user_index, &state) == 0 && (state.Gamepad.wButtons & kXInputGamepadY))
+                const bool rescan = now >= m_next_slot_rescan;
+                if (rescan) { m_next_slot_rescan = now + kSlotRescanInterval; }
+
+                for (DWORD user_index = 0; user_index < 4; ++user_index)
                 {
-                    y_is_down = true;
-                    break;
+                    // Steady state: skip slots known to be empty. Only the 1Hz re-scan probes them
+                    // (the expensive XInputGetState-on-empty-slot enumeration happens at most 4x/sec).
+                    if (!rescan && !m_slot_connected[user_index]) { continue; }
+
+                    XInputState state{};
+                    const bool connected = (m_xinput_get_state(user_index, &state) == 0);
+                    if (rescan) { m_slot_connected[user_index] = connected; }
+                    if (!connected) { continue; }
+
+                    const auto& pad = state.Gamepad;
+                    if (pad.wButtons & kXInputGamepadY) { y_is_down = true; }
+
+                    const auto stick = [](SHORT v) {
+                        return static_cast<int>(v) > kStickActivity || static_cast<int>(v) < -kStickActivity;
+                    };
+                    if (pad.wButtons != 0 ||
+                        stick(pad.sThumbLX) || stick(pad.sThumbLY) ||
+                        stick(pad.sThumbRX) || stick(pad.sThumbRY) ||
+                        static_cast<int>(pad.bLeftTrigger) > kTriggerActivity ||
+                        static_cast<int>(pad.bRightTrigger) > kTriggerActivity)
+                    {
+                        gamepad_active = true;
+                    }
                 }
             }
 
+            // Y rising edge -> queue the evict + switch to the gamepad glyph.
             if (y_is_down && !m_gamepad_y_was_down)
             {
                 m_last_input_gamepad = true;
                 m_y_pressed_edge = true;
             }
-
             m_gamepad_y_was_down = y_is_down;
+
+            auto kbm_active = false;
+            if (ensure_user32())
+            {
+                const auto down = [this](int vk) {
+                    return (static_cast<unsigned short>(m_get_async_key_state(vk)) & 0x8000u) != 0;
+                };
+                if (down(kVkLButton) || down(kVkRButton) || down(kVkMButton) ||
+                    down(kVkW) || down(kVkA) || down(kVkS) || down(kVkD) ||
+                    down(kVkSpace) || down(kVkShift) || down(kVkControl))
+                {
+                    kbm_active = true;
+                }
+                if (!kbm_active && m_get_cursor_pos)
+                {
+                    CursorPoint point{};
+                    if (m_get_cursor_pos(&point) != 0)
+                    {
+                        if (m_have_last_mouse && (point.x != m_last_mouse_x || point.y != m_last_mouse_y))
+                        {
+                            kbm_active = true;
+                        }
+                        m_last_mouse_x = point.x;
+                        m_last_mouse_y = point.y;
+                        m_have_last_mouse = true;
+                    }
+                }
+            }
+
+            // Gamepad wins ties (if somehow both moved this tick): the user just grabbed the pad.
+            if (gamepad_active) { m_last_input_gamepad = true; }
+            else if (kbm_active) { m_last_input_gamepad = false; }
         }
 
         auto ensure_xinput() -> bool
@@ -103,67 +171,6 @@ namespace lmc
             return m_get_async_key_state != nullptr;
         }
 
-        // Pick the glyph (E vs round Y) by the device the player is using RIGHT NOW, not by the last
-        // evict key pressed. "Last active device wins": gamepad button/stick/trigger -> Y; keyboard
-        // key / mouse button / mouse movement -> E; no input -> keep the previous choice.
-        auto detect_current_input_device() -> void
-        {
-            auto gamepad_active = false;
-            if (ensure_xinput())
-            {
-                for (DWORD user_index = 0; user_index < 4; ++user_index)
-                {
-                    XInputState state{};
-                    if (m_xinput_get_state(user_index, &state) != 0) { continue; }
-                    const auto& pad = state.Gamepad;
-                    const auto stick = [](SHORT v) {
-                        return static_cast<int>(v) > kStickActivity || static_cast<int>(v) < -kStickActivity;
-                    };
-                    if (pad.wButtons != 0 ||
-                        stick(pad.sThumbLX) || stick(pad.sThumbLY) ||
-                        stick(pad.sThumbRX) || stick(pad.sThumbRY) ||
-                        static_cast<int>(pad.bLeftTrigger) > kTriggerActivity ||
-                        static_cast<int>(pad.bRightTrigger) > kTriggerActivity)
-                    {
-                        gamepad_active = true;
-                        break;
-                    }
-                }
-            }
-
-            auto kbm_active = false;
-            if (ensure_user32())
-            {
-                const auto down = [this](int vk) {
-                    return (static_cast<unsigned short>(m_get_async_key_state(vk)) & 0x8000u) != 0;
-                };
-                if (down(kVkLButton) || down(kVkRButton) || down(kVkMButton) ||
-                    down(kVkW) || down(kVkA) || down(kVkS) || down(kVkD) ||
-                    down(kVkSpace) || down(kVkShift) || down(kVkControl))
-                {
-                    kbm_active = true;
-                }
-                if (!kbm_active && m_get_cursor_pos)
-                {
-                    CursorPoint point{};
-                    if (m_get_cursor_pos(&point) != 0)
-                    {
-                        if (m_have_last_mouse && (point.x != m_last_mouse_x || point.y != m_last_mouse_y))
-                        {
-                            kbm_active = true;
-                        }
-                        m_last_mouse_x = point.x;
-                        m_last_mouse_y = point.y;
-                        m_have_last_mouse = true;
-                    }
-                }
-            }
-
-            // Gamepad wins ties (if somehow both moved this frame): the user just grabbed the pad.
-            if (gamepad_active) { m_last_input_gamepad = true; }
-            else if (kbm_active) { m_last_input_gamepad = false; }
-        }
-
         HMODULE m_xinput_module{};
         XInputGetStateFn m_xinput_get_state{};
         HMODULE m_user32_module{};
@@ -177,5 +184,8 @@ namespace lmc
         bool m_gamepad_y_was_down{};
         bool m_last_input_gamepad{};
         bool m_y_pressed_edge{};
+        bool m_slot_connected[4]{};        // which XInput slots are physically present (refreshed 1Hz)
+        Clock::time_point m_next_input_at{};
+        Clock::time_point m_next_slot_rescan{};
     };
 }
