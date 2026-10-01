@@ -57,8 +57,18 @@ In-game:
 
 - Gothic 1 Remake (PC).
 - [UE4SS](https://github.com/UE4SS-RE/RE-UE4SS) installed into the game's
-  `G1R\Binaries\Win64` folder. The mod is built against UE4SS **v3.0.1**
-  (commit `272ce2f80450dbcf11c53e2ae57fa5649d2d39be`).
+  `G1R\Binaries\Win64` folder — either flat (`Win64\UE4SS.dll`, `Win64\Mods`,
+  the stable-release layout) or in the `Win64\ue4ss\` subfolder that
+  experimental builds since mid-2024 use (`Win64\dwmapi.dll` +
+  `Win64\ue4ss\{UE4SS.dll, Mods\}`; the proxy prefers `ue4ss\UE4SS.dll`, and
+  the mods folder and `UE4SS.log` live next to the loaded `UE4SS.dll`).
+  The mod is built against an **experimental**
+  UE4SS build: `v3.0.1-954-g272ce2f` (commit
+  `272ce2f80450dbcf11c53e2ae57fa5649d2d39be`, June 2026). It is **not**
+  compatible with the stable UE4SS **v3.0.1** release (February 2024), even
+  though both builds report themselves as "3.0.1". Players without this exact
+  build should use the full release archive, which bundles it (see
+  [Release archives](#release-archives)).
 
 For building:
 
@@ -108,10 +118,13 @@ cpp\build\LetMeCraft\Game__Shipping__Win64\LetMeCraft.dll
 
 ## Installing into the game
 
-1. Locate the UE4SS mods folder inside the game installation:
+1. Locate the UE4SS mods folder inside the game installation. It sits next to
+   the loaded `UE4SS.dll`: use the `ue4ss` subfolder if it exists, otherwise
+   the flat one (UE4SS ignores `Win64\Mods` while `Win64\ue4ss\Mods` exists):
 
    ```text
-   <Gothic 1 Remake install folder>\G1R\Binaries\Win64\Mods\
+   <Gothic 1 Remake install folder>\G1R\Binaries\Win64\ue4ss\Mods\   (ue4ss subfolder layout)
+   <Gothic 1 Remake install folder>\G1R\Binaries\Win64\Mods\         (flat layout)
    ```
 
 2. Copy the built DLL there as `main.dll` (the UE4SS C++ mod naming
@@ -135,6 +148,64 @@ cpp\build\LetMeCraft\Game__Shipping__Win64\LetMeCraft.dll
 To update the mod after a rebuild, just overwrite `main.dll` with the new
 build (with the game closed). To uninstall, remove the `LetMeCraft` folder and
 its line from `mods.txt`.
+
+## Release archives
+
+`scripts\package.ps1` builds the redistributable archives into `dist\`. By
+default, one run produces both:
+
+| Archive | Contents | For whom |
+|---|---|---|
+| `LetMeCraft-v<version>.zip` | Flat game-root layout (`G1R\Binaries\Win64\...`): mod + UE4SS loader (`dwmapi.dll`, `UE4SS.dll`, settings, license) + stock UE4SS Lua mods; `mods.txt` lists the mod | Players **without** UE4SS, or with an incompatible UE4SS build |
+| `LetMeCraft-v<version>-no-ue4ss.zip` | A single `LetMeCraft\` folder: `dlls\main.dll`, `enabled.txt`, `README.txt` | Players who **already** have the UE4SS build the mod targets; nothing outside the mod folder is touched |
+
+- The full archive is extracted into the folder that contains `G1R`.
+- The mod-only archive is extracted into the player's UE4SS **mods folder**:
+  `G1R\Binaries\Win64\ue4ss\Mods` if the `ue4ss` subfolder exists, otherwise
+  `G1R\Binaries\Win64\Mods`. A game-root path would not work for both UE4SS
+  layouts: with the `ue4ss\` layout, UE4SS ignores `Win64\Mods` as long as
+  `ue4ss\Mods` exists.
+- `enabled.txt` turns the mod on without editing `mods.txt`. A mod starts if
+  it has `enabled.txt` **or** a `: 1` line in `mods.txt`, so disabling it
+  needs both removed.
+- Because the full archive is flat, a player whose UE4SS sits in `ue4ss\`
+  must rename that folder before installing it, or the proxy keeps loading the
+  old `ue4ss\UE4SS.dll`. Both player READMEs describe this switch, and warn
+  that the full archive overwrites `mods.txt`, `UE4SS-settings.ini` and the
+  stock mods.
+
+The player-facing instructions inside the archives come from
+`scripts\release-readme.txt` (full) and `scripts\release-readme-no-ue4ss.txt`
+(mod-only), both in Russian.
+
+```powershell
+.\scripts\package.ps1                          # build mod + UE4SS proxy, produce both archives
+.\scripts\package.ps1 -Which Full              # only the full archive
+.\scripts\package.ps1 -Which ModOnly           # only the mod-only archive (skips the proxy)
+.\scripts\package.ps1 -SkipBuild               # package what is already in the build tree
+```
+
+- `All`/`Full` need the UE4SS runtime in the build tree (`build.ps1 -Full`).
+  `-Which ModOnly` needs only the mod DLL when packaging, but *building* the
+  mod still compiles `UE4SS.dll` (and its Rust step), because the mod target
+  links against it.
+- To refresh only the mod without touching UE4SS or Rust (needs a previously
+  built `UE4SS.lib`), relink it and package without building:
+
+  ```powershell
+  MSBuild cpp\build-vs2022\LetMeCraft\LetMeCraft.vcxproj -p:Configuration=Game__Shipping__Win64 -p:Platform=x64 -p:BuildProjectReferences=false
+  .\scripts\package.ps1 -Which ModOnly -SkipBuild
+  ```
+
+- All inputs are checked before anything is packaged. If a previous ZIP of a
+  requested archive is open in another program, the script stops without
+  changing anything. Otherwise the previous ZIPs of the requested archives are
+  removed first, and on failure no staging folder or half-written ZIP is left.
+  An archive that was not requested is left untouched in `dist\`.
+
+> When the pinned RE-UE4SS commit changes, update the required UE4SS build in
+> `scripts\release-readme-no-ue4ss.txt` and in [Requirements](#requirements)
+> together with it.
 
 ## Verifying it works
 
